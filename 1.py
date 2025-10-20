@@ -10,6 +10,58 @@ import cv2
 import numpy as np
 
 
+def anisotropic_diffusion(
+    image: np.ndarray,
+    num_iter: int = 15,
+    kappa: float = 20.0,
+    gamma: float = 0.15,
+    option: int = 1,
+) -> np.ndarray:
+    """Apply Perona-Malik anisotropic diffusion to smooth the image."""
+
+    if image.ndim != 2:
+        raise ValueError("Anisotropic diffusion expects a single channel image")
+
+    if not (0.0 < gamma <= 0.25):
+        raise ValueError("gamma must be in the range (0, 0.25]")
+
+    diffused = image.astype(np.float32).copy()
+
+    for _ in range(num_iter):
+        nabla_north = np.zeros_like(diffused)
+        nabla_south = np.zeros_like(diffused)
+        nabla_east = np.zeros_like(diffused)
+        nabla_west = np.zeros_like(diffused)
+
+        nabla_north[1:, :] = diffused[1:, :] - diffused[:-1, :]
+        nabla_south[:-1, :] = diffused[:-1, :] - diffused[1:, :]
+        nabla_east[:, :-1] = diffused[:, :-1] - diffused[:, 1:]
+        nabla_west[:, 1:] = diffused[:, 1:] - diffused[:, :-1]
+
+        if option == 1:
+            c_n = np.exp(-(nabla_north / kappa) ** 2)
+            c_s = np.exp(-(nabla_south / kappa) ** 2)
+            c_e = np.exp(-(nabla_east / kappa) ** 2)
+            c_w = np.exp(-(nabla_west / kappa) ** 2)
+        elif option == 2:
+            c_n = 1.0 / (1.0 + (nabla_north / kappa) ** 2)
+            c_s = 1.0 / (1.0 + (nabla_south / kappa) ** 2)
+            c_e = 1.0 / (1.0 + (nabla_east / kappa) ** 2)
+            c_w = 1.0 / (1.0 + (nabla_west / kappa) ** 2)
+        else:
+            raise ValueError("option must be either 1 or 2")
+
+        diffused += gamma * (
+            c_n * nabla_north
+            + c_s * nabla_south
+            + c_e * nabla_east
+            + c_w * nabla_west
+        )
+
+    diffused = np.clip(diffused, 0.0, 1.0)
+    return diffused
+
+
 def anisotropic_gaussian_derivative_kernel(
     order: int,
     sigma_major: float,
@@ -194,21 +246,25 @@ def extract_inner_outer_contours(
     image_shape: Tuple[int, int],
     min_area_ratio: float = 1e-3,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract both external and internal contours from the edge map."""
+
     h, w = image_shape
     edge_u8 = (edge_map > 0).astype(np.uint8) * 255
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     closed = cv2.morphologyEx(edge_u8, cv2.MORPH_CLOSE, kernel, iterations=2)
+    dilated = cv2.dilate(closed, kernel, iterations=1)
 
-    filled = closed.copy()
+    filled = dilated.copy()
     mask = np.zeros((h + 2, w + 2), np.uint8)
     cv2.floodFill(filled, mask, (0, 0), 255)
     filled = cv2.bitwise_not(filled)
-    region = cv2.bitwise_or(closed, filled)
+    region = cv2.bitwise_or(dilated, filled)
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
-    region_filtered = np.zeros_like(region)
     min_area = max(int(min_area_ratio * h * w), 1)
+
+    region_filtered = np.zeros_like(region)
     for label in range(1, num_labels):
         area = stats[label, cv2.CC_STAT_AREA]
         if area >= min_area:
@@ -217,20 +273,35 @@ def extract_inner_outer_contours(
     if np.count_nonzero(region_filtered) == 0:
         region_filtered = region
 
-    contours, _ = cv2.findContours(region_filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(
+        region_filtered, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+    )
+
     outer_mask = np.zeros((h, w), dtype=np.uint8)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        cv2.drawContours(outer_mask, [largest], -1, 255, thickness=cv2.FILLED)
+    object_mask = np.zeros((h, w), dtype=np.uint8)
+    hole_mask = np.zeros((h, w), dtype=np.uint8)
+    inner_boundary = np.zeros((h, w), dtype=np.uint8)
+    outer_boundary = np.zeros((h, w), dtype=np.uint8)
+
+    if hierarchy is not None:
+        hierarchy = hierarchy[0]
+        for idx, contour in enumerate(contours):
+            contour_area = cv2.contourArea(contour)
+            if contour_area < min_area:
+                continue
+
+            parent = hierarchy[idx][3]
+            if parent == -1:
+                cv2.drawContours(object_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                cv2.drawContours(outer_boundary, [contour], -1, 255, thickness=1)
+            else:
+                cv2.drawContours(hole_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                cv2.drawContours(inner_boundary, [contour], -1, 255, thickness=1)
     else:
-        outer_mask = region_filtered
+        object_mask = region_filtered.copy()
+        outer_boundary = cv2.Canny(object_mask, 50, 150)
 
-    inner_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    eroded = cv2.erode(outer_mask, inner_kernel, iterations=1)
-    dilated = cv2.dilate(outer_mask, inner_kernel, iterations=1)
-
-    inner_boundary = cv2.subtract(outer_mask, eroded)
-    outer_boundary = cv2.subtract(dilated, outer_mask)
+    outer_mask = cv2.subtract(object_mask, hole_mask)
 
     return inner_boundary, outer_boundary, outer_mask, region_filtered
 
@@ -253,10 +324,14 @@ def process_image(
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), sigmaX=0)
-    gray_norm = cv2.normalize(gray.astype(np.float32), None, alpha=0.0, beta=1.0, norm_type=cv2.NORM_MINMAX)
+    gray_norm = cv2.normalize(
+        gray.astype(np.float32), None, alpha=0.0, beta=1.0, norm_type=cv2.NORM_MINMAX
+    )
+
+    diffused = anisotropic_diffusion(gray_norm, num_iter=20, kappa=25.0, gamma=0.2, option=1)
 
     gradients = compute_multi_direction_gradients(
-        gray_norm,
+        diffused,
         num_orientations=num_orientations,
         sigma_major=sigma_major,
         sigma_minor=sigma_minor,
@@ -278,7 +353,12 @@ def process_image(
 
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_gray.png"), (gray_norm * 255).astype(np.uint8))
+    cv2.imwrite(
+        os.path.join(output_dir, f"{base_name}_gray.png"), (gray_norm * 255).astype(np.uint8)
+    )
+    cv2.imwrite(
+        os.path.join(output_dir, f"{base_name}_diffused.png"), (diffused * 255).astype(np.uint8)
+    )
     cv2.imwrite(os.path.join(output_dir, f"{base_name}_magnitude.png"), cv2.normalize(gradients.magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
     cv2.imwrite(os.path.join(output_dir, f"{base_name}_nms.png"), cv2.normalize(suppressed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
     cv2.imwrite(os.path.join(output_dir, f"{base_name}_edges.png"), edges)
