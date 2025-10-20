@@ -17,10 +17,25 @@ Download the SOIS dataset from [BaiDuNetdisk](https://pan.baidu.com/s/1SaOsQ61q
 ### How to use
 
 * This demo can be easily used by running the 'demo.py' file.
-  
+
   ```
   python demo.py
   ```
+
+* To extract inner and outer contours with the anisotropic gradient-based
+  operator introduced in this repository, run ``gradient_contours.py`` and pass
+  the path to the input image. Intermediate results and the final overlay are
+  written to ``data/output`` by default.
+
+  ```bash
+  python gradient_contours.py data/input/16.png --output data/output
+  ```
+
+  The script uses multi-directional first- and second-order anisotropic
+  Gaussian derivatives to estimate gradient orientation and strength, applies
+  non-maximum suppression, and performs adaptive thresholding followed by
+  morphological post-processing to recover both the outer (red) and inner
+  (green) contours of the sparse structure.
 
 ### Citation
 
