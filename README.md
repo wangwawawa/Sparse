@@ -33,9 +33,15 @@ Download the SOIS dataset from [BaiDuNetdisk](https://pan.baidu.com/s/1SaOsQ61q
 
   The script uses multi-directional first- and second-order anisotropic
   Gaussian derivatives to estimate gradient orientation and strength, applies
-  non-maximum suppression, and performs adaptive thresholding followed by
-  morphological post-processing to recover both the outer (red) and inner
-  (green) contours of the sparse structure.
+  non-maximum suppression, and performs adaptive thresholding to obtain a
+  point cloud of candidate boundary pixels. Instead of an α-shape filter, the
+  candidate points are fed into a Delaunay triangulation; edges are retained
+  when the local sampling density or gradient statistics change sharply across
+  the triangles that share the edge. The surviving boundary graph is smoothed
+  and rasterised back to the image grid before extracting the inner (green)
+  and outer (red) contours, producing more stable outlines on non-uniform point
+  clouds and soft boundaries. The command also stores the intermediate
+  ``*_delaunay_mask.png`` produced by the statistical Delaunay filtering stage.
 
 ### Citation
 
