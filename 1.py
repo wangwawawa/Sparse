@@ -168,77 +168,101 @@ def compute_multi_direction_gradients(
 
 
 def non_maximum_suppression(magnitude: np.ndarray, direction: np.ndarray) -> np.ndarray:
-    """Suppress non-maximum responses along the gradient direction."""
+    """Suppress non-maximum responses along the gradient direction via interpolation."""
+
     if magnitude.dtype != np.float32:
         mag = magnitude.astype(np.float32)
     else:
         mag = magnitude
 
-    angle = np.degrees(direction)
-    angle = (angle + 180.0) % 180.0
-    quantized = np.round(angle / 45.0).astype(np.int32) % 4
+    # Ensure directions are wrapped to [0, pi)
+    theta = np.mod(direction, np.pi).astype(np.float32)
 
-    suppressed = np.zeros_like(mag)
+    rows, cols = mag.shape
+    yy, xx = np.indices((rows, cols), dtype=np.float32)
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
 
-    shift_left = np.roll(mag, 1, axis=1)
-    shift_right = np.roll(mag, -1, axis=1)
-    shift_up = np.roll(mag, 1, axis=0)
-    shift_down = np.roll(mag, -1, axis=0)
+    pos_x = xx + cos_theta
+    pos_y = yy + sin_theta
+    neg_x = xx - cos_theta
+    neg_y = yy - sin_theta
 
-    shift_upleft = np.roll(shift_left, 1, axis=0)
-    shift_upright = np.roll(shift_right, 1, axis=0)
-    shift_downleft = np.roll(shift_left, -1, axis=0)
-    shift_downright = np.roll(shift_right, -1, axis=0)
+    mag_float = mag.astype(np.float32)
+    pos_vals = cv2.remap(
+        mag_float,
+        pos_x,
+        pos_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    neg_vals = cv2.remap(
+        mag_float,
+        neg_x,
+        neg_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
 
-    masks = [
-        quantized == 0,
-        quantized == 1,
-        quantized == 2,
-        quantized == 3,
-    ]
-
-    neighbors = [
-        (shift_left, shift_right),
-        (shift_upright, shift_downleft),
-        (shift_up, shift_down),
-        (shift_upleft, shift_downright),
-    ]
-
-    for mask, (pos, neg) in zip(masks, neighbors):
-        comparison = (mag >= pos) & (mag >= neg)
-        selected = mask & comparison
-        suppressed[selected] = mag[selected]
+    suppressed = np.zeros_like(mag_float)
+    keep_mask = (mag_float >= pos_vals) & (mag_float >= neg_vals)
+    suppressed[keep_mask] = mag_float[keep_mask]
 
     suppressed[[0, -1], :] = 0
     suppressed[:, [0, -1]] = 0
     return suppressed
 
 
-def adaptive_threshold(magnitude: np.ndarray, window: int = 21, k: float = 0.7) -> np.ndarray:
-    """Adaptive threshold based on local mean and deviation."""
-    if window % 2 == 0:
-        window += 1
+def histogram_adaptive_threshold(
+    magnitude: np.ndarray, s: float = 0.8, tau: float = 0.65
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute strong/weak edge maps using histogram-based thresholds."""
 
-    mag = magnitude.copy()
-    mag[mag < 0] = 0
+    mag = magnitude.astype(np.float32)
+    mag = np.clip(mag, a_min=0.0, a_max=None)
 
-    mean = cv2.blur(mag, (window, window))
-    mean_sq = cv2.blur(mag**2, (window, window))
-    variance = np.clip(mean_sq - mean**2, a_min=0, a_max=None)
-    std = np.sqrt(variance)
+    mag_min = float(mag.min())
+    mag_max = float(mag.max())
+    if mag_max > mag_min:
+        mag_norm = (mag - mag_min) / (mag_max - mag_min)
+    else:
+        mag_norm = np.zeros_like(mag)
 
-    threshold_map = mean + k * std
-    global_threshold = mag.mean() + 0.5 * mag.std()
+    hist, _ = np.histogram((mag_norm * 255).astype(np.uint8), bins=256, range=(0, 255))
+    cumulative = np.cumsum(hist)
+    total = mag_norm.size
+    threshold_count = s * total
+    high_index = int(np.searchsorted(cumulative, threshold_count))
+    high_index = min(max(high_index, 0), 255)
+    high_threshold = min(high_index / 255.0, 1.0)
+    low_threshold = tau * high_threshold
 
-    binary = (mag > threshold_map) & (mag > global_threshold)
-    return binary.astype(np.uint8)
+    strong_edges = np.zeros_like(mag_norm, dtype=np.uint8)
+    strong_edges[mag_norm >= high_threshold] = 255
+
+    weak_edges = np.zeros_like(mag_norm, dtype=np.uint8)
+    mask = (mag_norm >= low_threshold) & (mag_norm < high_threshold)
+    weak_edges[mask] = 255
+
+    return mag_norm, strong_edges, weak_edges
 
 
-def clean_edge_map(edge_map: np.ndarray) -> np.ndarray:
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cleaned = cv2.morphologyEx(edge_map, cv2.MORPH_CLOSE, kernel, iterations=2)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
-    return cleaned
+def connect_weak_edges(strong: np.ndarray, weak: np.ndarray) -> np.ndarray:
+    """Connect weak edges to strong edges within an 8-neighborhood."""
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    connected = strong.copy()
+    remaining = weak.copy()
+
+    while True:
+        expanded = cv2.dilate(connected, kernel, iterations=1)
+        attach = cv2.bitwise_and(remaining, expanded)
+        if not np.any(attach):
+            break
+        connected = cv2.bitwise_or(connected, attach)
+        remaining[attach > 0] = 0
+
+    return connected
 
 
 def extract_inner_outer_contours(
@@ -312,8 +336,8 @@ def process_image(
     num_orientations: int = 8,
     sigma_major: float = 3.0,
     sigma_minor: float = 1.5,
-    threshold_window: int = 21,
-    threshold_k: float = 0.7,
+    threshold_s: float = 0.8,
+    threshold_tau: float = 0.65,
     min_area_ratio: float = 1e-3,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
@@ -338,8 +362,11 @@ def process_image(
     )
 
     suppressed = non_maximum_suppression(gradients.magnitude, gradients.direction)
-    edges = adaptive_threshold(suppressed, window=threshold_window, k=threshold_k)
-    edges = clean_edge_map(edges)
+
+    esm_norm, strong_edges, weak_edges = histogram_adaptive_threshold(
+        suppressed, s=threshold_s, tau=threshold_tau
+    )
+    edges = connect_weak_edges(strong_edges, weak_edges)
 
     inner_boundary, outer_boundary, object_mask, region = extract_inner_outer_contours(
         edges,
@@ -359,8 +386,18 @@ def process_image(
     cv2.imwrite(
         os.path.join(output_dir, f"{base_name}_diffused.png"), (diffused * 255).astype(np.uint8)
     )
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_magnitude.png"), cv2.normalize(gradients.magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_nms.png"), cv2.normalize(suppressed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
+    cv2.imwrite(
+        os.path.join(output_dir, f"{base_name}_magnitude.png"),
+        cv2.normalize(gradients.magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+    )
+    cv2.imwrite(
+        os.path.join(output_dir, f"{base_name}_nms.png"),
+        cv2.normalize(suppressed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+    )
+    cv2.imwrite(
+        os.path.join(output_dir, f"{base_name}_esm.png"),
+        (esm_norm * 255).astype(np.uint8),
+    )
     cv2.imwrite(os.path.join(output_dir, f"{base_name}_edges.png"), edges)
     cv2.imwrite(os.path.join(output_dir, f"{base_name}_mask.png"), object_mask)
     cv2.imwrite(os.path.join(output_dir, f"{base_name}_inner.png"), inner_boundary)
@@ -379,8 +416,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orientations", type=int, default=8, help="Number of filter orientations")
     parser.add_argument("--sigma-major", type=float, default=3.0, help="Gaussian sigma along the major axis")
     parser.add_argument("--sigma-minor", type=float, default=1.5, help="Gaussian sigma along the minor axis")
-    parser.add_argument("--window", type=int, default=21, help="Adaptive threshold window size")
-    parser.add_argument("--k", type=float, default=0.7, help="Adaptive threshold sensitivity factor")
+    parser.add_argument("--s", type=float, default=0.8, help="Histogram proportion for high threshold")
+    parser.add_argument("--tau", type=float, default=0.65, help="Low-to-high threshold ratio")
     parser.add_argument(
         "--min-area-ratio",
         type=float,
@@ -398,8 +435,8 @@ def main() -> None:
         num_orientations=args.orientations,
         sigma_major=args.sigma_major,
         sigma_minor=args.sigma_minor,
-        threshold_window=args.window,
-        threshold_k=args.k,
+        threshold_s=args.s,
+        threshold_tau=args.tau,
         min_area_ratio=args.min_area_ratio,
     )
 
