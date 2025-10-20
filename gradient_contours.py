@@ -1,27 +1,18 @@
-"""Gradient-based contour extraction using anisotropic Gaussian derivatives.
-
-This module extends the original anisotropic gradient operator with a
-Delaunay-based contour reconstruction stage that replaces the previous
-\alpha-shape thresholding. The new stage evaluates local density changes and
-gradient discontinuities on the Delaunay graph to decide whether an edge lies
-on the boundary. Afterwards the boundary graph is regularised and rasterised
-to recover smooth inner/outer contours while remaining within the
-point-cloud → triangulation → contour pipeline of the original repository.
-"""
+"""Gradient-guided binary segmentation followed by sparse contour recovery."""
 from __future__ import annotations
 
 import argparse
 import os
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Tuple
 
 import cv2
 import numpy as np
-from scipy.spatial import Delaunay
+
+from sparse import edge as sparse_edge
 
 
-EPS = 1e-6
+EPS = 1e-8
 
 
 def anisotropic_gaussian_derivative_kernel(
@@ -31,22 +22,7 @@ def anisotropic_gaussian_derivative_kernel(
     theta: float,
     size: int | None = None,
 ) -> np.ndarray:
-    """Create an anisotropic Gaussian derivative kernel rotated by ``theta``.
-
-    Parameters
-    ----------
-    order:
-        Order of derivative along the major axis (1 or 2).
-    sigma_major:
-        Standard deviation along the major axis of the Gaussian.
-    sigma_minor:
-        Standard deviation along the minor axis of the Gaussian.
-    theta:
-        Orientation angle in radians.
-    size:
-        Optional kernel size. If ``None`` a size large enough to cover three
-        standard deviations of the anisotropic Gaussian is used.
-    """
+    """Create a rotated anisotropic Gaussian derivative kernel."""
     if order not in (1, 2):
         raise ValueError("Only first and second order derivatives are supported")
 
@@ -56,20 +32,19 @@ def anisotropic_gaussian_derivative_kernel(
     half = size // 2
 
     y, x = np.mgrid[-half : half + 1, -half : half + 1]
-    cos_theta = np.cos(theta)
-    sin_theta = np.sin(theta)
+    cos_theta = float(np.cos(theta))
+    sin_theta = float(np.sin(theta))
 
     x_rot = x * cos_theta + y * sin_theta
     y_rot = -x * sin_theta + y * cos_theta
 
     gaussian = np.exp(
-        -0.5
-        * ((x_rot / sigma_major) ** 2 + (y_rot / sigma_minor) ** 2)
+        -0.5 * ((x_rot / sigma_major) ** 2 + (y_rot / sigma_minor) ** 2)
     )
 
     if order == 1:
         kernel = -(x_rot / (sigma_major**2)) * gaussian
-    else:  # order == 2
+    else:
         kernel = ((x_rot**2 - sigma_major**2) / (sigma_major**4)) * gaussian
 
     kernel -= kernel.mean()
@@ -95,7 +70,7 @@ def compute_multi_direction_gradients(
 ) -> GradientResponses:
     """Compute directional gradients using anisotropic Gaussian derivatives."""
     if image.ndim != 2:
-        raise ValueError("Gradient computation expects a single-channel image")
+        raise ValueError("Expected a single-channel image")
 
     thetas = np.linspace(0.0, np.pi, num=num_orientations, endpoint=False)
     first_responses = []
@@ -114,13 +89,12 @@ def compute_multi_direction_gradients(
 
     first_abs = np.abs(first_stack)
     best_idx = np.argmax(first_abs, axis=0)
-
     direction = thetas[best_idx]
 
     first_selected = np.take_along_axis(first_stack, best_idx[np.newaxis, ...], axis=0)[0]
     second_selected = np.take_along_axis(second_stack, best_idx[np.newaxis, ...], axis=0)[0]
 
-    magnitude = np.abs(second_selected)
+    magnitude = np.sqrt(first_selected**2 + second_selected**2)
 
     return GradientResponses(
         magnitude=magnitude.astype(np.float32),
@@ -131,12 +105,8 @@ def compute_multi_direction_gradients(
 
 
 def non_maximum_suppression(magnitude: np.ndarray, direction: np.ndarray) -> np.ndarray:
-    """Suppress non-maximum responses along the gradient direction."""
-    if magnitude.dtype != np.float32:
-        mag = magnitude.astype(np.float32)
-    else:
-        mag = magnitude
-
+    """Suppress non-maximum responses along gradient directions."""
+    mag = magnitude.astype(np.float32, copy=False)
     angle = np.degrees(direction)
     angle = (angle + 180.0) % 180.0
     quantized = np.round(angle / 45.0).astype(np.int32) % 4
@@ -159,7 +129,6 @@ def non_maximum_suppression(magnitude: np.ndarray, direction: np.ndarray) -> np.
         quantized == 2,
         quantized == 3,
     ]
-
     neighbors = [
         (shift_left, shift_right),
         (shift_upright, shift_downleft),
@@ -197,201 +166,67 @@ def adaptive_threshold(magnitude: np.ndarray, window: int = 21, k: float = 0.7) 
     return binary.astype(np.uint8)
 
 
-def clean_edge_map(edge_map: np.ndarray) -> np.ndarray:
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cleaned = cv2.morphologyEx(edge_map, cv2.MORPH_CLOSE, kernel, iterations=2)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
-    return cleaned
+def fill_holes(binary: np.ndarray) -> np.ndarray:
+    mask = np.zeros((binary.shape[0] + 2, binary.shape[1] + 2), dtype=np.uint8)
+    flood = binary.copy()
+    cv2.floodFill(flood, mask, (0, 0), 255)
+    flood = cv2.bitwise_not(flood)
+    filled = cv2.bitwise_or(binary, flood)
+    return filled
 
 
-def _triangle_areas(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
-    tri_pts = points[simplices]
-    vec1 = tri_pts[:, 1, :] - tri_pts[:, 0, :]
-    vec2 = tri_pts[:, 2, :] - tri_pts[:, 0, :]
-    areas = 0.5 * np.abs(vec1[:, 0] * vec2[:, 1] - vec1[:, 1] * vec2[:, 0])
-    return np.maximum(areas, EPS)
+def largest_component(mask: np.ndarray, min_area: int) -> np.ndarray:
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return mask
+
+    sizes = stats[1:, cv2.CC_STAT_AREA]
+    best_idx = int(np.argmax(sizes)) + 1
+    best_area = int(sizes[best_idx - 1])
+    if best_area < min_area:
+        return mask
+
+    result = np.zeros_like(mask)
+    result[labels == best_idx] = 255
+    return result
 
 
-def _prune_short_branches(
-    points: np.ndarray,
-    edges: Set[Tuple[int, int]],
-    min_branch_length: float,
-) -> Set[Tuple[int, int]]:
-    if not edges:
-        return edges
-
-    adjacency: List[Set[int]] = [set() for _ in range(points.shape[0])]
-    for u, v in edges:
-        adjacency[u].add(v)
-        adjacency[v].add(u)
-
-    queue: List[int] = [idx for idx, nbrs in enumerate(adjacency) if len(nbrs) == 1]
-    processed = set()
-
-    while queue:
-        node = queue.pop()
-        if node in processed:
-            continue
-        processed.add(node)
-        if len(adjacency[node]) != 1:
-            continue
-        neighbour = next(iter(adjacency[node]))
-        length = np.linalg.norm(points[node] - points[neighbour])
-        if length < min_branch_length:
-            adjacency[node].remove(neighbour)
-            adjacency[neighbour].remove(node)
-            edges.discard(tuple(sorted((node, neighbour))))
-            if len(adjacency[neighbour]) == 1:
-                queue.append(neighbour)
-
-    return edges
-
-
-def build_delaunay_boundary_mask(
-    points_rc: np.ndarray,
-    gradient_values: np.ndarray,
-    image_shape: Tuple[int, int],
-    density_ratio_threshold: float = 0.35,
-    gradient_ratio_threshold: float = 0.45,
-    edge_strength_threshold: float = 0.2,
-    min_branch_length: float = 5.0,
+def build_binary_mask(
+    image: np.ndarray,
+    responses: GradientResponses,
+    adaptive_window: int,
+    adaptive_k: float,
+    min_area_ratio: float,
 ) -> np.ndarray:
-    """Derive a boundary mask using local density/gradient changes on Delaunay graph."""
+    suppressed = non_maximum_suppression(responses.magnitude, responses.direction)
+    adaptive = adaptive_threshold(suppressed, adaptive_window, adaptive_k)
 
-    if points_rc.shape[0] < 3:
-        mask = np.zeros(image_shape, dtype=np.uint8)
-        rows = np.clip(points_rc[:, 0], 0, image_shape[0] - 1)
-        cols = np.clip(points_rc[:, 1], 0, image_shape[1] - 1)
-        mask[rows, cols] = 255
-        return mask
+    suppressed_norm = cv2.normalize(suppressed, None, 0, 255, cv2.NORM_MINMAX)
+    suppressed_norm = suppressed_norm.astype(np.uint8)
 
-    points_xy = points_rc[:, ::-1].astype(np.float32)
-
-    try:
-        delaunay = Delaunay(points_xy)
-    except (ValueError, RuntimeError):
-        mask = np.zeros(image_shape, dtype=np.uint8)
-        rows = np.clip(points_rc[:, 0], 0, image_shape[0] - 1)
-        cols = np.clip(points_rc[:, 1], 0, image_shape[1] - 1)
-        mask[rows, cols] = 255
-        return mask
-
-    simplices = delaunay.simplices
-    areas = _triangle_areas(points_xy, simplices)
-
-    vertex_density = np.zeros(points_xy.shape[0], dtype=np.float32)
-    triangle_gradient = np.zeros(simplices.shape[0], dtype=np.float32)
-
-    for tri_idx, simplex in enumerate(simplices):
-        weight = 1.0 / areas[tri_idx]
-        triangle_gradient[tri_idx] = float(np.mean(gradient_values[simplex]))
-        vertex_density[simplex] += weight
-
-    triangle_density = np.mean(vertex_density[simplices], axis=1)
-
-    edge_to_tri: Dict[Tuple[int, int], List[int]] = defaultdict(list)
-    for tri_idx, simplex in enumerate(simplices):
-        tri_edges = (
-            (simplex[0], simplex[1]),
-            (simplex[1], simplex[2]),
-            (simplex[2], simplex[0]),
-        )
-        for u, v in tri_edges:
-            edge_to_tri[tuple(sorted((u, v)))].append(tri_idx)
-
-    max_grad = float(np.max(gradient_values) + EPS)
-    boundary_edges: Set[Tuple[int, int]] = set()
-
-    for edge, triangles in edge_to_tri.items():
-        u, v = edge
-        edge_strength = 0.5 * (gradient_values[u] + gradient_values[v]) / max_grad
-        if edge_strength < edge_strength_threshold:
-            continue
-
-        if len(triangles) == 1:
-            boundary_edges.add(edge)
-            continue
-
-        if len(triangles) > 2:
-            triangles = triangles[:2]
-
-        t1, t2 = triangles
-        dens1, dens2 = triangle_density[t1], triangle_density[t2]
-        grad1, grad2 = triangle_gradient[t1], triangle_gradient[t2]
-
-        density_change = abs(dens1 - dens2) / (max(dens1, dens2) + EPS)
-        gradient_change = abs(grad1 - grad2) / (max(grad1, grad2) + EPS)
-
-        if density_change > density_ratio_threshold or gradient_change > gradient_ratio_threshold:
-            boundary_edges.add(edge)
-
-    boundary_edges = _prune_short_branches(points_xy, boundary_edges, min_branch_length)
-
-    mask = np.zeros(image_shape, dtype=np.uint8)
-    if not boundary_edges:
-        return mask
-
-    for u, v in boundary_edges:
-        p1 = points_xy[u]
-        p2 = points_xy[v]
-        pt1 = (int(np.clip(round(p1[0]), 0, image_shape[1] - 1)), int(np.clip(round(p1[1]), 0, image_shape[0] - 1)))
-        pt2 = (int(np.clip(round(p2[0]), 0, image_shape[1] - 1)), int(np.clip(round(p2[1]), 0, image_shape[0] - 1)))
-        cv2.line(mask, pt1, pt2, 255, 1, lineType=cv2.LINE_AA)
+    adaptive_u8 = (adaptive * 255).astype(np.uint8)
+    _, otsu = cv2.threshold(suppressed_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edges = cv2.bitwise_or(adaptive_u8, otsu)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=1.0)
-    _, mask = cv2.threshold(mask, 32, 255, cv2.THRESH_BINARY)
-    return mask
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    dilated = cv2.dilate(closed, kernel, iterations=1)
 
+    filled = fill_holes(dilated)
 
-def extract_inner_outer_contours(
-    boundary_mask: np.ndarray,
-    image_shape: Tuple[int, int],
-    min_area_ratio: float = 1e-3,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    h, w = image_shape
-    edge_u8 = (boundary_mask > 0).astype(np.uint8) * 255
+    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=1.2)
+    _, global_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    global_mask = cv2.bitwise_not(global_mask)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    closed = cv2.morphologyEx(edge_u8, cv2.MORPH_CLOSE, kernel, iterations=2)
+    refined = cv2.bitwise_and(filled, global_mask)
+    refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    filled = closed.copy()
-    mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(filled, mask, (0, 0), 255)
-    filled = cv2.bitwise_not(filled)
-    region = cv2.bitwise_or(closed, filled)
+    min_area = max(int(min_area_ratio * image.shape[0] * image.shape[1]), 1)
+    refined = largest_component(refined, min_area)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
-    region_filtered = np.zeros_like(region)
-    min_area = max(int(min_area_ratio * h * w), 1)
-    for label in range(1, num_labels):
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area >= min_area:
-            region_filtered[labels == label] = 255
-
-    if np.count_nonzero(region_filtered) == 0:
-        region_filtered = region
-
-    contours, _ = cv2.findContours(region_filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    outer_mask = np.zeros((h, w), dtype=np.uint8)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        perimeter = cv2.arcLength(largest, True)
-        epsilon = max(1.5, 0.01 * perimeter)
-        approx = cv2.approxPolyDP(largest, epsilon, True)
-        cv2.drawContours(outer_mask, [approx], -1, 255, thickness=cv2.FILLED)
-    else:
-        outer_mask = region_filtered
-
-    inner_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    eroded = cv2.erode(outer_mask, inner_kernel, iterations=1)
-    dilated = cv2.dilate(outer_mask, inner_kernel, iterations=1)
-
-    inner_boundary = cv2.subtract(outer_mask, eroded)
-    outer_boundary = cv2.subtract(dilated, outer_mask)
-
-    return inner_boundary, outer_boundary, outer_mask, region_filtered
+    refined = cv2.GaussianBlur(refined, (0, 0), sigmaX=0.8)
+    _, refined = cv2.threshold(refined, 127, 255, cv2.THRESH_BINARY)
+    return refined
 
 
 def process_image(
@@ -400,132 +235,80 @@ def process_image(
     num_orientations: int = 8,
     sigma_major: float = 3.0,
     sigma_minor: float = 1.5,
-    threshold_window: int = 21,
-    threshold_k: float = 0.7,
-    min_area_ratio: float = 1e-3,
-    density_ratio_threshold: float = 0.35,
-    gradient_ratio_threshold: float = 0.45,
-    edge_strength_threshold: float = 0.2,
-    min_branch_length: float = 5.0,
-) -> None:
-    os.makedirs(output_dir, exist_ok=True)
+    adaptive_window: int = 21,
+    adaptive_k: float = 0.7,
+    min_area_ratio: float = 5e-4,
+    eps: float = 1e-2,
+) -> Tuple[str, str]:
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(image_path)
 
-    image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if image is None:
-        raise FileNotFoundError(f"Unable to load image: {image_path}")
+        raise ValueError(f"Failed to read image: {image_path}")
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), sigmaX=0)
-    gray_norm = cv2.normalize(gray.astype(np.float32), None, alpha=0.0, beta=1.0, norm_type=cv2.NORM_MINMAX)
-
-    gradients = compute_multi_direction_gradients(
-        gray_norm,
+    responses = compute_multi_direction_gradients(
+        image,
         num_orientations=num_orientations,
         sigma_major=sigma_major,
         sigma_minor=sigma_minor,
     )
-
-    suppressed = non_maximum_suppression(gradients.magnitude, gradients.direction)
-    edges = adaptive_threshold(suppressed, window=threshold_window, k=threshold_k)
-    edges = clean_edge_map(edges)
-
-    points_rc = np.column_stack(np.nonzero(edges))
-    gradient_values = gradients.magnitude[points_rc[:, 0], points_rc[:, 1]] if points_rc.size else np.array([])
-
-    boundary_mask = build_delaunay_boundary_mask(
-        points_rc,
-        gradient_values,
-        image_shape=gray.shape,
-        density_ratio_threshold=density_ratio_threshold,
-        gradient_ratio_threshold=gradient_ratio_threshold,
-        edge_strength_threshold=edge_strength_threshold,
-        min_branch_length=min_branch_length,
-    )
-
-    inner_boundary, outer_boundary, object_mask, region = extract_inner_outer_contours(
-        boundary_mask,
-        image_shape=gray.shape,
+    binary_mask = build_binary_mask(
+        image,
+        responses,
+        adaptive_window=adaptive_window,
+        adaptive_k=adaptive_k,
         min_area_ratio=min_area_ratio,
     )
 
-    overlay = image.copy()
-    overlay[outer_boundary > 0] = (0, 0, 255)
-    overlay[inner_boundary > 0] = (0, 255, 0)
+    contour_image = sparse_edge(binary_mask, eps)
 
-    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    contour_path = os.path.join(output_dir, f"{base}_contour.png")
+    binary_path = os.path.join(output_dir, f"{base}_binary.png")
 
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_gray.png"), (gray_norm * 255).astype(np.uint8))
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_magnitude.png"), cv2.normalize(gradients.magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_nms.png"), cv2.normalize(suppressed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_edges.png"), edges)
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_delaunay_mask.png"), boundary_mask)
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_mask.png"), object_mask)
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_inner.png"), inner_boundary)
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_outer.png"), outer_boundary)
-    cv2.imwrite(os.path.join(output_dir, f"{base_name}_overlay.png"), overlay)
+    cv2.imwrite(contour_path, contour_image)
+    cv2.imwrite(binary_path, binary_mask)
+
+    return contour_path, binary_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract inner and outer contours using anisotropic gradients")
-    parser.add_argument("image", help="Path to the input image")
+    parser = argparse.ArgumentParser(description="Gradient guided contour extraction")
+    parser.add_argument("image", help="Path to the input grayscale image")
     parser.add_argument(
         "--output",
         default="data/output",
-        help="Directory to store intermediate results",
+        help="Directory where the contour and binary images will be stored",
     )
     parser.add_argument("--orientations", type=int, default=8, help="Number of filter orientations")
-    parser.add_argument("--sigma-major", type=float, default=3.0, help="Gaussian sigma along the major axis")
-    parser.add_argument("--sigma-minor", type=float, default=1.5, help="Gaussian sigma along the minor axis")
+    parser.add_argument("--sigma-major", type=float, default=3.0, help="Major-axis sigma for anisotropic Gaussian")
+    parser.add_argument("--sigma-minor", type=float, default=1.5, help="Minor-axis sigma for anisotropic Gaussian")
     parser.add_argument("--window", type=int, default=21, help="Adaptive threshold window size")
-    parser.add_argument("--k", type=float, default=0.7, help="Adaptive threshold sensitivity factor")
+    parser.add_argument("--k", type=float, default=0.7, help="Adaptive threshold balancing term")
     parser.add_argument(
         "--min-area-ratio",
         type=float,
-        default=1e-3,
-        help="Minimum area ratio used to discard small components",
+        default=5e-4,
+        help="Minimum kept component area as a fraction of the image",
     )
-    parser.add_argument(
-        "--density-ratio",
-        type=float,
-        default=0.35,
-        help="Density change threshold for retaining a Delaunay edge",
-    )
-    parser.add_argument(
-        "--gradient-ratio",
-        type=float,
-        default=0.45,
-        help="Gradient change threshold for retaining a Delaunay edge",
-    )
-    parser.add_argument(
-        "--edge-strength",
-        type=float,
-        default=0.2,
-        help="Minimum normalised edge strength required to keep an edge",
-    )
-    parser.add_argument(
-        "--min-branch-length",
-        type=float,
-        default=5.0,
-        help="Prune boundary branches shorter than this length (in pixels)",
-    )
+    parser.add_argument("--eps", type=float, default=1e-2, help="Alpha selection tolerance for sparse contour extractor")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     process_image(
-        image_path=args.image,
-        output_dir=args.output,
+        args.image,
+        args.output,
         num_orientations=args.orientations,
         sigma_major=args.sigma_major,
         sigma_minor=args.sigma_minor,
-        threshold_window=args.window,
-        threshold_k=args.k,
+        adaptive_window=args.window,
+        adaptive_k=args.k,
         min_area_ratio=args.min_area_ratio,
-        density_ratio_threshold=args.density_ratio,
-        gradient_ratio_threshold=args.gradient_ratio,
-        edge_strength_threshold=args.edge_strength,
-        min_branch_length=args.min_branch_length,
+        eps=args.eps,
     )
 
 

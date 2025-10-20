@@ -22,26 +22,25 @@ Download the SOIS dataset from [BaiDuNetdisk](https://pan.baidu.com/s/1SaOsQ61q
   python demo.py
   ```
 
-* To extract inner and outer contours with the anisotropic gradient-based
-  operator introduced in this repository, run ``gradient_contours.py`` and pass
-  the path to the input image. Intermediate results and the final overlay are
-  written to ``data/output`` by default.
+* To obtain the gradient-driven binary mask together with the contour recovered
+  through the sparse triangulation pipeline, run ``gradient_contours.py`` and
+  pass the path to the input image. The script stores exactly two artefacts in
+  ``data/output`` by default: ``*_contour.png`` (the refined outline rendered on
+  a white canvas) and ``*_binary.png`` (the cleaned binary mask inferred from
+  anisotropic gradient responses).
 
   ```bash
   python gradient_contours.py data/input/16.png --output data/output
   ```
 
-  The script uses multi-directional first- and second-order anisotropic
-  Gaussian derivatives to estimate gradient orientation and strength, applies
-  non-maximum suppression, and performs adaptive thresholding to obtain a
-  point cloud of candidate boundary pixels. Instead of an α-shape filter, the
-  candidate points are fed into a Delaunay triangulation; edges are retained
-  when the local sampling density or gradient statistics change sharply across
-  the triangles that share the edge. The surviving boundary graph is smoothed
-  and rasterised back to the image grid before extracting the inner (green)
-  and outer (red) contours, producing more stable outlines on non-uniform point
-  clouds and soft boundaries. The command also stores the intermediate
-  ``*_delaunay_mask.png`` produced by the statistical Delaunay filtering stage.
+  The workflow mirrors the original repository: multi-directional first- and
+  second-order anisotropic Gaussian derivatives provide dense gradient
+  responses; non-maximum suppression and adaptive thresholding with an
+  additional Otsu prior generate a confident binary mask of the swarm region.
+  This mask is handed to the existing ``sparse.edge`` routine, which performs
+  the Delaunay-based contour reconstruction and yields the smooth outer
+  boundary. Only the contour and binary images are saved to disk, making it
+  straightforward to evaluate segmentation accuracy.
 
 ### Citation
 
