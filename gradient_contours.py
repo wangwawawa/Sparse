@@ -253,7 +253,7 @@ def process_image(
         sigma_major=sigma_major,
         sigma_minor=sigma_minor,
     )
-    binary_mask = build_binary_mask(
+    initial_mask = build_binary_mask(
         image,
         responses,
         adaptive_window=adaptive_window,
@@ -261,7 +261,19 @@ def process_image(
         min_area_ratio=min_area_ratio,
     )
 
-    contour_image = sparse_edge(binary_mask, eps)
+    sparse_mask = sparse_edge(initial_mask, eps)
+
+    if sparse_mask.ndim == 3:
+        sparse_mask = cv2.cvtColor(sparse_mask, cv2.COLOR_BGR2GRAY)
+
+    _, sparse_mask = cv2.threshold(sparse_mask, 127, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(
+        sparse_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+    )
+    contour_image = np.zeros_like(sparse_mask)
+    if contours:
+        cv2.drawContours(contour_image, contours, -1, 255, thickness=1)
 
     os.makedirs(output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(image_path))[0]
@@ -269,7 +281,7 @@ def process_image(
     binary_path = os.path.join(output_dir, f"{base}_binary.png")
 
     cv2.imwrite(contour_path, contour_image)
-    cv2.imwrite(binary_path, binary_mask)
+    cv2.imwrite(binary_path, sparse_mask)
 
     return contour_path, binary_path
 
