@@ -7,17 +7,15 @@ import dataclasses
 import json
 import zlib
 from pathlib import Path
-
-import numpy as np
+from typing import List, Sequence, Tuple
 
 from texture_alpha_shape import (
     AlphaStabilityAnalyzer,
     PointSampler,
     TextureAwareAlphaShape,
-    TextureFeatureExtractor,
     TextureAwareAlphaShapeResult,
+    TextureFeatureExtractor,
 )
-
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -43,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-points",
         type=int,
-        default=4000,
+        default=1500,
         help="Maximum number of sampled points",
     )
     parser.add_argument(
@@ -61,12 +59,12 @@ def parse_args() -> argparse.Namespace:
         "--contour-color",
         type=str,
         default="0,0,255",
-        help="BGR colour for overlaying the contour",
+        help="B,G,R colour for overlaying the contour",
     )
     return parser.parse_args()
 
 
-def parse_color(value: str) -> tuple:
+def parse_color(value: str) -> Tuple[int, int, int]:
     parts = value.split(",")
     if len(parts) != 3:
         raise ValueError("Colour must be specified as B,G,R")
@@ -91,42 +89,40 @@ def _paeth_predictor(a: int, b: int, c: int) -> int:
     return c
 
 
-def _png_unfilter(filter_type: int, row: np.ndarray, prev: np.ndarray, bpp: int) -> np.ndarray:
-    """Reverse a single PNG filter row using integer arithmetic."""
-
-    # Promote the operands to a wider dtype to prevent wrap-around before we
-    # explicitly apply the modulo operation mandated by the PNG specification.
-    row_int = row.astype(np.int32, copy=False)
-    prev_int = prev.astype(np.int32, copy=False)
-    result = np.empty(row_int.shape, dtype=np.int32)
+def _png_unfilter(filter_type: int, row: bytes, prev: bytes, bpp: int) -> bytes:
+    row_vals = list(row)
+    prev_vals = list(prev)
+    result = [0] * len(row_vals)
 
     if filter_type == 0:
-        result[:] = row_int
-    elif filter_type == 1:
-        for idx in range(row_int.size):
+        return bytes(row_vals)
+    if filter_type == 1:
+        for idx, value in enumerate(row_vals):
             left = result[idx - bpp] if idx >= bpp else 0
-            result[idx] = (row_int[idx] + left) & 0xFF
-    elif filter_type == 2:
-        result[:] = (row_int + prev_int) & 0xFF
-    elif filter_type == 3:
-        for idx in range(row_int.size):
+            result[idx] = (value + left) & 0xFF
+        return bytes(result)
+    if filter_type == 2:
+        for idx, value in enumerate(row_vals):
+            result[idx] = (value + prev_vals[idx]) & 0xFF
+        return bytes(result)
+    if filter_type == 3:
+        for idx, value in enumerate(row_vals):
             left = result[idx - bpp] if idx >= bpp else 0
-            up = prev_int[idx]
-            result[idx] = (row_int[idx] + ((left + up) // 2)) & 0xFF
-    elif filter_type == 4:
-        for idx in range(row_int.size):
+            up = prev_vals[idx]
+            result[idx] = (value + ((left + up) // 2)) & 0xFF
+        return bytes(result)
+    if filter_type == 4:
+        for idx, value in enumerate(row_vals):
             left = result[idx - bpp] if idx >= bpp else 0
-            up = prev_int[idx]
-            up_left = prev_int[idx - bpp] if idx >= bpp else 0
+            up = prev_vals[idx]
+            up_left = prev_vals[idx - bpp] if idx >= bpp else 0
             predictor = _paeth_predictor(left, up, up_left)
-            result[idx] = (row_int[idx] + predictor) & 0xFF
-    else:
-        raise ValueError(f"Unsupported PNG filter type {filter_type}")
-
-    return result.astype(np.uint8)
+            result[idx] = (value + predictor) & 0xFF
+        return bytes(result)
+    raise ValueError(f"Unsupported PNG filter type {filter_type}")
 
 
-def read_image(path: Path) -> np.ndarray:
+def read_image(path: Path) -> List[List[int]]:
     data = path.read_bytes()
     if not data.startswith(PNG_SIGNATURE):
         raise ValueError("Only 8-bit PNG images are supported")
@@ -144,7 +140,7 @@ def read_image(path: Path) -> np.ndarray:
         offset += 4
         chunk_data = data[offset : offset + length]
         offset += length
-        offset += 4  # CRC (ignored)
+        offset += 4  # Skip CRC
 
         if chunk_type == b"IHDR":
             width = int.from_bytes(chunk_data[0:4], "big")
@@ -167,57 +163,85 @@ def read_image(path: Path) -> np.ndarray:
         raise ValueError("Unsupported PNG colour type")
 
     stride = width * bytes_per_pixel
-    rows = []
+    rows: List[bytes] = []
     pos = 0
-    prev = np.zeros(stride, dtype=np.uint8)
+    prev = bytes([0] * stride)
     for _ in range(height):
         filter_type = decompressed[pos]
         pos += 1
-        row = np.frombuffer(decompressed[pos : pos + stride], dtype=np.uint8)
+        row = decompressed[pos : pos + stride]
         pos += stride
         recon = _png_unfilter(filter_type, row, prev, bytes_per_pixel)
         rows.append(recon)
         prev = recon
 
-    image = np.vstack(rows).reshape(height, stride)
+    pixels: List[List[int]] = []
     if color_type == 0:
-        return image.reshape(height, width)
+        for y in range(height):
+            row_data = list(rows[y][:width])
+            pixels.append(row_data)
+        return pixels
     if color_type == 2:
-        rgb = image.reshape(height, width, 3)
-        gray = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.uint8)
-        return gray
+        for y in range(height):
+            row = rows[y]
+            gray_row: List[int] = []
+            for x in range(width):
+                r = row[3 * x]
+                g = row[3 * x + 1]
+                b = row[3 * x + 2]
+                gray = int(round(0.299 * r + 0.587 * g + 0.114 * b))
+                gray_row.append(gray)
+            pixels.append(gray_row)
+        return pixels
     if color_type == 4:
-        rgba = image.reshape(height, width, 2)
-        return rgba[..., 0]
+        for y in range(height):
+            row = rows[y]
+            gray_row = [row[2 * x] for x in range(width)]
+            pixels.append(gray_row)
+        return pixels
     if color_type == 6:
-        rgba = image.reshape(height, width, 4)
-        rgb = rgba[..., :3]
-        gray = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.uint8)
-        return gray
+        for y in range(height):
+            row = rows[y]
+            gray_row: List[int] = []
+            for x in range(width):
+                r = row[4 * x]
+                g = row[4 * x + 1]
+                b = row[4 * x + 2]
+                gray = int(round(0.299 * r + 0.587 * g + 0.114 * b))
+                gray_row.append(gray)
+            pixels.append(gray_row)
+        return pixels
     raise ValueError("Unsupported PNG format")
 
 
-def write_image(path: Path, image: np.ndarray) -> None:
-    if image.ndim == 2:
-        colour_type = 0
-        payload = image.astype(np.uint8)
-    elif image.ndim == 3 and image.shape[2] == 3:
-        colour_type = 2
-        payload = image.astype(np.uint8)
-    else:
-        raise ValueError("Only grayscale or RGB images can be saved")
+def write_image(path: Path, image: List[List[int]] | List[List[List[int]]]) -> None:
+    if not image:
+        raise ValueError("Image is empty")
 
-    height, width = payload.shape[:2]
+    if isinstance(image[0][0], list):  # type: ignore[index]
+        colour_type = 2
+        height = len(image)
+        width = len(image[0])
+        rows: List[bytes] = []
+        for row in image:  # type: ignore[assignment]
+            flat: List[int] = []
+            for pixel in row:  # type: ignore[assignment]
+                if len(pixel) != 3:
+                    raise ValueError("RGB rows must contain triplets")
+                flat.extend(int(max(0, min(255, channel))) for channel in pixel)
+            rows.append(bytes([0] + flat))
+    else:
+        colour_type = 0
+        height = len(image)
+        width = len(image[0])
+        rows = [bytes([0] + [int(max(0, min(255, value))) for value in row]) for row in image]
+
     ihdr = (
         width.to_bytes(4, "big")
         + height.to_bytes(4, "big")
         + bytes([8, colour_type, 0, 0, 0])
     )
 
-    if colour_type == 0:
-        rows = [b"\x00" + row.tobytes() for row in payload]
-    else:
-        rows = [b"\x00" + row.reshape(-1).tobytes() for row in payload]
     compressed = zlib.compress(b"".join(rows))
 
     with path.open("wb") as fh:
@@ -228,17 +252,35 @@ def write_image(path: Path, image: np.ndarray) -> None:
 
 
 def overlay_contours(
-    image: np.ndarray,
+    image: List[List[int]],
     result: TextureAwareAlphaShapeResult,
-    color: tuple,
+    color: Tuple[int, int, int],
     thickness: int = 2,
-) -> np.ndarray:
-    overlay = np.repeat(image[..., None], 3, axis=2).astype(np.uint8)
+) -> List[List[List[int]]]:
+    height = len(image)
+    width = len(image[0]) if height else 0
+    overlay: List[List[List[int]]] = []
+    for y in range(height):
+        row: List[List[int]] = []
+        for x in range(width):
+            value = int(image[y][x])
+            row.append([value, value, value])
+        overlay.append(row)
+
     mask = result.render_mask(thickness=thickness)
-    mask = mask.astype(bool)
-    for channel, value in enumerate(color):
-        overlay[..., channel] = np.where(mask, value, overlay[..., channel])
+    for y in range(min(height, len(mask))):
+        row_mask = mask[y]
+        for x in range(min(width, len(row_mask))):
+            if row_mask[x]:
+                overlay[y][x] = [color[0], color[1], color[2]]
     return overlay
+
+
+def linspace(start: float, stop: float, count: int) -> List[float]:
+    if count <= 1:
+        return [start]
+    step = (stop - start) / (count - 1)
+    return [start + i * step for i in range(count)]
 
 
 def main() -> None:
@@ -248,17 +290,10 @@ def main() -> None:
         raise FileNotFoundError(image_path)
 
     image = read_image(image_path)
-    if image.ndim == 3:
-        image = np.dot(image[..., :3], [0.299, 0.587, 0.114])
-    if image.ndim != 2:
-        raise RuntimeError("Input image must be grayscale or convertible to grayscale")
-    image = image.astype(np.float32)
-    if image.max() <= 1.0:
-        image = (image * 255.0).astype(np.uint8)
-    else:
-        image = image.astype(np.uint8)
+    if not image or not image[0]:
+        raise RuntimeError("Input image is empty")
 
-    alpha_values = np.linspace(args.alpha_min, args.alpha_max, args.alpha_steps)
+    alpha_values = linspace(args.alpha_min, args.alpha_max, args.alpha_steps)
 
     extractor = TextureFeatureExtractor()
     features = extractor.extract(image)
@@ -299,4 +334,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

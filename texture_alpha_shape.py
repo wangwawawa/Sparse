@@ -1,29 +1,198 @@
-"""Texture-aware alpha shape contour extraction.
-
-This module implements the pipeline described in
-``docs/texture_aware_alpha_shape.md``.  It contains the following stages:
-
-1. ``TextureFeatureExtractor`` – compute gradient and multi-scale Gabor
-   texture descriptors for every pixel in a grayscale image.
-2. ``PointSampler`` – select representative pixels for the α-shape based on
-   edge evidence and texture saliency while retaining their feature vectors.
-3. ``TextureAwareAlphaShape`` – construct a texture-weighted α-shape by
-   modifying the triangle acceptance test using the texture consistency term.
-4. ``AlphaStabilityAnalyzer`` – scan across α values and pick the one that
-   maximises the combined geometry/texture stability criterion.
-
-The public API intentionally mirrors the design document so that each class
-corresponds to one section of the specification.  The implementation is
-deliberately NumPy-only so it can run in lightweight environments without
-OpenCV or SciPy.
-"""
+"""Texture-aware alpha shape contour extraction without external dependencies."""
 
 from __future__ import annotations
+
 import math
+import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import numpy as np
+Image = List[List[int]]
+FloatImage = List[List[float]]
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+
+def image_shape(image: Image | FloatImage) -> Tuple[int, int]:
+    return len(image), len(image[0]) if image else 0
+
+
+def zeros_like(image: FloatImage, value: float = 0.0) -> FloatImage:
+    h, w = image_shape(image)
+    return [[value for _ in range(w)] for _ in range(h)]
+
+
+def to_float_image(image: Image) -> FloatImage:
+    if not image:
+        return []
+    max_value = max(max(row) for row in image) or 1
+    scale = 1.0 / max_value
+    return [[pixel * scale for pixel in row] for row in image]
+
+
+def reflect_index(idx: int, size: int) -> int:
+    if size <= 1:
+        return 0
+    while idx < 0 or idx >= size:
+        if idx < 0:
+            idx = -idx - 1
+        if idx >= size:
+            idx = (2 * size - idx) - 1
+    return idx
+
+
+def convolve2d(image: FloatImage, kernel: FloatImage) -> FloatImage:
+    kh = len(kernel)
+    kw = len(kernel[0]) if kh else 0
+    pad_y = kh // 2
+    pad_x = kw // 2
+    height, width = image_shape(image)
+    output = [[0.0 for _ in range(width)] for _ in range(height)]
+    for y in range(height):
+        for x in range(width):
+            acc = 0.0
+            for ky in range(kh):
+                iy = reflect_index(y + ky - pad_y, height)
+                row = image[iy]
+                kernel_row = kernel[ky]
+                for kx in range(kw):
+                    ix = reflect_index(x + kx - pad_x, width)
+                    acc += row[ix] * kernel_row[kx]
+            output[y][x] = acc
+    return output
+
+
+def convolve_separable(image: FloatImage, kernel: List[float], axis: int) -> FloatImage:
+    height, width = image_shape(image)
+    radius = len(kernel) // 2
+    output = [[0.0 for _ in range(width)] for _ in range(height)]
+    if axis == 0:
+        for y in range(height):
+            for x in range(width):
+                acc = 0.0
+                for k, weight in enumerate(kernel):
+                    offset = k - radius
+                    iy = reflect_index(y + offset, height)
+                    acc += image[iy][x] * weight
+                output[y][x] = acc
+    else:
+        for y in range(height):
+            for x in range(width):
+                acc = 0.0
+                for k, weight in enumerate(kernel):
+                    offset = k - radius
+                    ix = reflect_index(x + offset, width)
+                    acc += image[y][ix] * weight
+                output[y][x] = acc
+    return output
+
+
+def gaussian_kernel1d(sigma: float) -> List[float]:
+    radius = max(1, int(round(3 * sigma)))
+    kernel: List[float] = []
+    norm = 0.0
+    for x in range(-radius, radius + 1):
+        value = math.exp(-(x * x) / (2.0 * sigma * sigma))
+        kernel.append(value)
+        norm += value
+    if norm == 0.0:
+        return [1.0]
+    return [value / norm for value in kernel]
+
+
+def gaussian_blur(image: FloatImage, sigma: float) -> FloatImage:
+    kernel = gaussian_kernel1d(sigma)
+    temp = convolve_separable(image, kernel, axis=0)
+    return convolve_separable(temp, kernel, axis=1)
+
+
+def downsample_image(image: FloatImage, factor: int) -> FloatImage:
+    height, width = image_shape(image)
+    if factor <= 1 or height == 0 or width == 0:
+        return [row[:] for row in image]
+    new_height = max(1, (height + factor - 1) // factor)
+    new_width = max(1, (width + factor - 1) // factor)
+    result = [[0.0 for _ in range(new_width)] for _ in range(new_height)]
+    for y in range(new_height):
+        for x in range(new_width):
+            acc = 0.0
+            count = 0
+            for dy in range(factor):
+                src_y = y * factor + dy
+                if src_y >= height:
+                    break
+                for dx in range(factor):
+                    src_x = x * factor + dx
+                    if src_x >= width:
+                        break
+                    acc += image[src_y][src_x]
+                    count += 1
+            result[y][x] = acc / max(1, count)
+    return result
+
+
+def upsample_image(image: FloatImage, factor: int, target_shape: Tuple[int, int]) -> FloatImage:
+    target_height, target_width = target_shape
+    if factor <= 1:
+        return [row[:target_width] for row in image[:target_height]]
+    height, width = image_shape(image)
+    result = [[0.0 for _ in range(target_width)] for _ in range(target_height)]
+    for y in range(target_height):
+        src_y = min(height - 1, y // factor)
+        row = image[src_y]
+        for x in range(target_width):
+            src_x = min(width - 1, x // factor)
+            result[y][x] = row[src_x]
+    return result
+
+
+def elementwise_pow(image: FloatImage, exponent: float) -> FloatImage:
+    return [[value ** exponent for value in row] for row in image]
+
+
+def elementwise_abs(image: FloatImage) -> FloatImage:
+    return [[abs(value) for value in row] for row in image]
+
+
+def normalise_image(image: FloatImage) -> FloatImage:
+    max_value = max((value for row in image for value in row), default=0.0)
+    if max_value <= 0.0:
+        return [row[:] for row in image]
+    return [[value / max_value for value in row] for row in image]
+
+
+def variance_of(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    mean = sum(values) / len(values)
+    return sum((value - mean) ** 2 for value in values) / len(values)
+
+
+def quantile(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    pos = q * (len(sorted_vals) - 1)
+    lower = int(math.floor(pos))
+    upper = int(math.ceil(pos))
+    if lower == upper:
+        return sorted_vals[lower]
+    weight = pos - lower
+    return sorted_vals[lower] * (1.0 - weight) + sorted_vals[upper] * weight
+
+
+def downsample(points: List[Tuple[int, int]], quota: int) -> List[Tuple[int, int]]:
+    if quota <= 0 or len(points) <= quota:
+        return points
+    stride = max(1, len(points) // quota)
+    return points[::stride]
+
+
+def magnitude(dx: float, dy: float) -> float:
+    return math.sqrt(dx * dx + dy * dy)
 
 
 # ---------------------------------------------------------------------------
@@ -31,136 +200,88 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 
-def _direct_convolve2d(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    kh, kw = kernel.shape
-    pad_y, pad_x = kh // 2, kw // 2
-    padded = np.pad(image, ((pad_y, pad_y), (pad_x, pad_x)), mode="reflect")
-    kernel_flipped = np.flip(kernel)
-    output = np.zeros_like(image, dtype=np.float32)
-    for y in range(image.shape[0]):
-        for x in range(image.shape[1]):
-            region = padded[y : y + kh, x : x + kw]
-            output[y, x] = float(np.sum(region * kernel_flipped))
-    return output
-
-
-def _fft_convolve2d(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    h, w = image.shape
-    kh, kw = kernel.shape
-    fh = h + kh - 1
-    fw = w + kw - 1
-    kernel_flipped = np.flip(kernel)
-    f_image = np.fft.rfft2(image, s=(fh, fw))
-    f_kernel = np.fft.rfft2(kernel_flipped, s=(fh, fw))
-    convolved = np.fft.irfft2(f_image * f_kernel, s=(fh, fw))
-    start_y = kh // 2
-    start_x = kw // 2
-    end_y = start_y + h
-    end_x = start_x + w
-    return convolved[start_y:end_y, start_x:end_x].astype(np.float32)
-
-
-def _convolve2d(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    if max(kernel.shape) <= 7:
-        return _direct_convolve2d(image, kernel.astype(np.float32))
-    return _fft_convolve2d(image, kernel.astype(np.float32))
-
-
-def _gaussian_kernel1d(sigma: float) -> np.ndarray:
-    radius = max(1, int(round(3 * sigma)))
-    x = np.arange(-radius, radius + 1, dtype=np.float32)
-    kernel = np.exp(-(x ** 2) / (2.0 * sigma ** 2))
-    kernel /= kernel.sum() or 1.0
-    return kernel
-
-
-def _convolve1d_reflect(image: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
-    pad = kernel.size // 2
-    pad_config = [(0, 0)] * image.ndim
-    pad_config[axis] = (pad, pad)
-    padded = np.pad(image, pad_config, mode="reflect")
-
-    def apply(vec: np.ndarray) -> np.ndarray:
-        return np.convolve(vec, kernel, mode="valid")
-
-    result = np.apply_along_axis(apply, axis, padded)
-    return result.astype(np.float32)
-
-
-def _gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
-    kernel = _gaussian_kernel1d(sigma)
-    temp = _convolve1d_reflect(image, kernel, axis=0)
-    return _convolve1d_reflect(temp, kernel, axis=1)
-
-
 @dataclass
 class TextureFeatures:
-    """Container for per-pixel texture descriptors."""
-
-    gradient_magnitude: np.ndarray
-    gradient_orientation: np.ndarray
-    gabor_response: np.ndarray
-    gabor_orientation: np.ndarray
-    texture_saliency: np.ndarray
+    gradient_magnitude: FloatImage
+    gradient_orientation: FloatImage
+    gabor_response: FloatImage
+    gabor_orientation: FloatImage
+    texture_saliency: FloatImage
 
 
 class TextureFeatureExtractor:
-    """Extracts gradient and multi-scale Gabor descriptors for each pixel."""
+    """Extract gradient and multi-scale Gabor descriptors for each pixel."""
 
     def __init__(
         self,
-        orientations: int = 8,
-        scales: int = 3,
-        base_sigma: float = 2.0,
+        orientations: int = 4,
+        scales: int = 1,
+        base_sigma: float = 1.5,
         gamma: float = 0.5,
-        kernel_size: int = 21,
+        kernel_size: int = 5,
     ) -> None:
         self.orientations = orientations
         self.scales = scales
         self.base_sigma = base_sigma
         self.gamma = gamma
-        self.kernel_size = int(max(3, kernel_size | 1))
+        self.kernel_size = max(3, kernel_size | 1)
 
     def _gabor_kernel(
         self, sigma: float, theta: float, lambd: float, gamma: float, psi: float
-    ) -> np.ndarray:
+    ) -> FloatImage:
         half = (self.kernel_size - 1) / 2.0
-        y, x = np.mgrid[-half : half + 1, -half : half + 1]
-        x_theta = x * math.cos(theta) + y * math.sin(theta)
-        y_theta = -x * math.sin(theta) + y * math.cos(theta)
-        gaussian_envelope = np.exp(
-            -0.5
-            * (
-                (x_theta ** 2) / (sigma ** 2)
-                + (gamma ** 2) * (y_theta ** 2) / (sigma ** 2)
-            )
-        )
-        sinusoid = np.cos((2.0 * math.pi * x_theta / lambd) + psi)
-        kernel = gaussian_envelope * sinusoid
-        return kernel.astype(np.float32)
+        kernel: FloatImage = []
+        for y in range(self.kernel_size):
+            row: List[float] = []
+            for x in range(self.kernel_size):
+                y_coord = y - half
+                x_coord = x - half
+                x_theta = x_coord * math.cos(theta) + y_coord * math.sin(theta)
+                y_theta = -x_coord * math.sin(theta) + y_coord * math.cos(theta)
+                gaussian = math.exp(
+                    -0.5
+                    * (
+                        (x_theta ** 2) / (sigma ** 2)
+                        + (gamma ** 2) * (y_theta ** 2) / (sigma ** 2)
+                    )
+                )
+                sinusoid = math.cos((2.0 * math.pi * x_theta / lambd) + psi)
+                row.append(gaussian * sinusoid)
+            kernel.append(row)
+        return kernel
 
-    def extract(self, image: np.ndarray) -> TextureFeatures:
-        if image.ndim != 2:
-            raise ValueError("TextureFeatureExtractor expects a grayscale image")
+    def extract(self, image: Image | FloatImage) -> TextureFeatures:
+        if not image or not image[0]:
+            raise ValueError("TextureFeatureExtractor expects a non-empty image")
 
-        image_float = image.astype(np.float32)
-        if image_float.max() > 1.0:
-            image_float /= 255.0
+        if isinstance(image[0][0], float):  # type: ignore[index]
+            image_float: FloatImage = [row[:] for row in image]  # type: ignore[assignment]
+        else:
+            image_float = to_float_image(image)  # type: ignore[arg-type]
 
-        sobel_x = np.array(
-            [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=np.float32
-        )
-        sobel_y = sobel_x.T
-        grad_x = _convolve2d(image_float, sobel_x) / 8.0
-        grad_y = _convolve2d(image_float, sobel_y) / 8.0
-        grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        grad_ori = np.arctan2(grad_y, grad_x)
+        height, width = image_shape(image_float)
+        factor = 2 if max(height, width) > 256 else 1
+        proc_image = downsample_image(image_float, factor)
+        proc_height, proc_width = image_shape(proc_image)
 
-        max_grad = float(grad_mag.max()) or 1.0
-        grad_mag_norm = grad_mag / max_grad
+        sobel_x = [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]]
+        sobel_y = [[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]]
+        grad_x = convolve2d(proc_image, sobel_x)
+        grad_y = convolve2d(proc_image, sobel_y)
 
-        gabor_max = np.zeros_like(image_float)
-        gabor_argmax = np.zeros_like(image_float)
+        grad_mag = [[0.0 for _ in range(width)] for _ in range(height)]
+        grad_ori = [[0.0 for _ in range(width)] for _ in range(height)]
+        for y in range(proc_height):
+            for x in range(proc_width):
+                gx = grad_x[y][x] / 8.0
+                gy = grad_y[y][x] / 8.0
+                grad_mag[y][x] = magnitude(gx, gy)
+                grad_ori[y][x] = math.atan2(gy, gx)
+
+        grad_mag_norm_proc = normalise_image([row[:proc_width] for row in grad_mag[:proc_height]])
+
+        gabor_max_proc = zeros_like(proc_image)
+        gabor_orientation_index_proc = zeros_like(proc_image)
 
         lambda_base = max(4.0, self.kernel_size / 4.0)
         idx = 0
@@ -176,30 +297,47 @@ class TextureFeatureExtractor:
                     gamma=self.gamma,
                     psi=0.0,
                 )
-                response = _convolve2d(image_float, kernel)
-                response = np.abs(response)
-
-                update_mask = response > gabor_max
-                gabor_max = np.where(update_mask, response, gabor_max)
-                gabor_argmax = np.where(update_mask, idx, gabor_argmax)
+                response = convolve2d(proc_image, kernel)
+                response_abs = elementwise_abs(response)
+                for y in range(proc_height):
+                    for x in range(proc_width):
+                        value = response_abs[y][x]
+                        if value > gabor_max_proc[y][x]:
+                            gabor_max_proc[y][x] = value
+                            gabor_orientation_index_proc[y][x] = float(idx)
                 idx += 1
 
-        max_response = float(gabor_max.max()) or 1.0
-        gabor_norm = gabor_max / max_response
+        gabor_norm_proc = normalise_image(gabor_max_proc)
 
-        # Convert the argmax indices back to orientation angles (0..2π)
         if self.orientations * self.scales > 0:
-            orientation_indices = gabor_argmax % self.orientations
-            gabor_orientation = orientation_indices * (math.pi / self.orientations)
+            gabor_orientation_proc = zeros_like(proc_image)
+            for y in range(proc_height):
+                for x in range(proc_width):
+                    orientation_index = int(gabor_orientation_index_proc[y][x]) % self.orientations
+                    gabor_orientation_proc[y][x] = orientation_index * (math.pi / self.orientations)
         else:
-            gabor_orientation = np.zeros_like(image_float)
+            gabor_orientation_proc = zeros_like(proc_image)
 
-        # Texture saliency via local variance (for sampling support)
-        blurred = _gaussian_blur(image_float, sigma=1.0)
-        squared_blur = _gaussian_blur(image_float ** 2, sigma=1.0)
-        texture_variance = np.maximum(squared_blur - blurred ** 2, 0.0)
-        max_var = float(texture_variance.max()) or 1.0
-        texture_saliency = texture_variance / max_var
+        blurred = gaussian_blur(proc_image, sigma=1.0)
+        squared_blur = gaussian_blur(elementwise_pow(proc_image, 2.0), sigma=1.0)
+        texture_variance_proc = zeros_like(proc_image)
+        for y in range(proc_height):
+            for x in range(proc_width):
+                variance = max(squared_blur[y][x] - blurred[y][x] ** 2, 0.0)
+                texture_variance_proc[y][x] = variance
+        texture_saliency_proc = normalise_image(texture_variance_proc)
+
+        if factor > 1:
+            grad_mag_norm = upsample_image(grad_mag_norm_proc, factor, (height, width))
+            grad_ori = upsample_image([row[:proc_width] for row in grad_ori[:proc_height]], factor, (height, width))
+            gabor_norm = upsample_image(gabor_norm_proc, factor, (height, width))
+            gabor_orientation = upsample_image(gabor_orientation_proc, factor, (height, width))
+            texture_saliency = upsample_image(texture_saliency_proc, factor, (height, width))
+        else:
+            grad_mag_norm = grad_mag_norm_proc
+            gabor_norm = gabor_norm_proc
+            gabor_orientation = gabor_orientation_proc
+            texture_saliency = texture_saliency_proc
 
         return TextureFeatures(
             gradient_magnitude=grad_mag_norm,
@@ -217,22 +355,20 @@ class TextureFeatureExtractor:
 
 @dataclass
 class SampledPointSet:
-    """Represents the sparse set of points used by the α-shape model."""
-
-    coordinates: np.ndarray  # (N, 2) array of (x, y) image coordinates
-    gradient_magnitude: np.ndarray
-    gradient_orientation: np.ndarray
-    gabor_response: np.ndarray
-    gabor_orientation: np.ndarray
-
+    coordinates: List[Tuple[float, float]]
+    gradient_magnitude: List[float]
+    gradient_orientation: List[float]
+    gabor_response: List[float]
+    gabor_orientation: List[float]
     image_shape: Tuple[int, int]
 
-    def as_dict(self) -> Dict[str, np.ndarray]:
+    def feature_triplet(self, indices: Tuple[int, int, int]) -> Dict[str, List[float]]:
+        i, j, k = indices
         return {
-            "gradient": self.gradient_magnitude,
-            "orientation": self.gradient_orientation,
-            "texture": self.gabor_response,
-            "texture_orientation": self.gabor_orientation,
+            "gradient": [self.gradient_magnitude[i], self.gradient_magnitude[j], self.gradient_magnitude[k]],
+            "texture": [self.gabor_response[i], self.gabor_response[j], self.gabor_response[k]],
+            "grad_orientation": [self.gradient_orientation[i], self.gradient_orientation[j], self.gradient_orientation[k]],
+            "tex_orientation": [self.gabor_orientation[i], self.gabor_orientation[j], self.gabor_orientation[k]],
         }
 
 
@@ -241,7 +377,7 @@ class PointSampler:
 
     def __init__(
         self,
-        max_points: int = 4000,
+        max_points: int = 1500,
         edge_ratio: float = 0.6,
         texture_ratio: float = 0.4,
         random_state: Optional[int] = None,
@@ -251,76 +387,84 @@ class PointSampler:
         self.max_points = max_points
         self.edge_ratio = edge_ratio
         self.texture_ratio = texture_ratio
-        self.random_state = np.random.default_rng(random_state)
+        self.rng = random.Random(random_state)
 
-    def sample(self, image: np.ndarray, features: TextureFeatures) -> SampledPointSet:
-        if image.ndim != 2:
-            raise ValueError("PointSampler expects a grayscale image")
+    def sample(self, image: Image | FloatImage, features: TextureFeatures) -> SampledPointSet:
+        height, width = image_shape(image)
 
-        h, w = image.shape
-        # Edge-driven sampling using gradient magnitude percentiles
-        grad_flat = features.gradient_magnitude.ravel()
-        if grad_flat.size == 0:
+        grad_values = [value for row in features.gradient_magnitude for value in row]
+        if not grad_values:
             raise ValueError("Empty gradient magnitude map")
-        edge_threshold = float(np.quantile(grad_flat, 0.75))
-        edge_threshold = max(edge_threshold, 0.1)
-        edge_map = features.gradient_magnitude >= edge_threshold
-        edge_coords = np.column_stack(np.nonzero(edge_map))
-
-        if edge_coords.size == 0:
-            edge_coords = np.column_stack(np.nonzero(features.gradient_magnitude > 0.2))
+        edge_threshold = max(quantile(grad_values, 0.75), 0.1)
+        edge_coords: List[Tuple[int, int]] = [
+            (y, x)
+            for y in range(height)
+            for x in range(width)
+            if features.gradient_magnitude[y][x] >= edge_threshold
+        ]
+        if not edge_coords:
+            edge_coords = [
+                (y, x)
+                for y in range(height)
+                for x in range(width)
+                if features.gradient_magnitude[y][x] > 0.2
+            ]
 
         edge_quota = max(3, int(self.max_points * self.edge_ratio))
-        edge_stride = max(1, len(edge_coords) // edge_quota)
-        edge_coords = edge_coords[::edge_stride]
+        edge_coords = downsample(edge_coords, edge_quota)
 
-        # Texture saliency sampling (top-k variance or Gabor response)
-        texture_map = np.maximum(features.gabor_response, features.texture_saliency)
-        texture_flat = texture_map.ravel()
-        if texture_flat.size == 0:
+        texture_map = [[max(features.gabor_response[y][x], features.texture_saliency[y][x]) for x in range(width)] for y in range(height)]
+        texture_values = [value for row in texture_map for value in row]
+        if not texture_values:
             raise ValueError("Empty texture map")
 
         texture_quota = max(3, int(self.max_points * self.texture_ratio))
-        threshold = 0.0
-        if texture_quota < texture_flat.size:
-            threshold = float(np.quantile(texture_flat, 1.0 - texture_quota / texture_flat.size))
+        threshold = quantile(texture_values, 1.0 - min(1.0, texture_quota / max(1, len(texture_values))))
+        texture_coords = [
+            (y, x)
+            for y in range(height)
+            for x in range(width)
+            if texture_map[y][x] >= threshold
+        ]
+        if not texture_coords:
+            texture_coords = [
+                (y, x)
+                for y in range(height)
+                for x in range(width)
+                if texture_map[y][x] > 0.0
+            ]
+        texture_coords = downsample(texture_coords, texture_quota)
 
-        tex_coords = np.column_stack(np.nonzero(texture_map >= threshold))
-        if tex_coords.size == 0:
-            tex_coords = np.column_stack(np.nonzero(texture_map > 0))
+        combined_set = {coord for coord in edge_coords}
+        combined_set.update(texture_coords)
 
-        tex_stride = max(1, len(tex_coords) // texture_quota)
-        tex_coords = tex_coords[::tex_stride]
+        if len(combined_set) < 3:
+            grid_size = max(3, int(math.sqrt(self.max_points)))
+            ys = [int(round(y)) for y in [i * (height - 1) / max(1, grid_size - 1) for i in range(grid_size)]]
+            xs = [int(round(x)) for x in [i * (width - 1) / max(1, grid_size - 1) for i in range(grid_size)]]
+            for y in ys:
+                for x in xs:
+                    combined_set.add((y, x))
 
-        coords = np.vstack([edge_coords, tex_coords]) if tex_coords.size else edge_coords
-        coords = np.unique(coords, axis=0)
+        coords = list(combined_set)
+        if len(coords) > self.max_points:
+            coords = self.rng.sample(coords, self.max_points)
 
-        if coords.shape[0] < 3:
-            # Uniform grid fallback
-            ys, xs = np.mgrid[0:h:complex(0, max(3, int(math.sqrt(self.max_points)))) ,
-                              0:w:complex(0, max(3, int(math.sqrt(self.max_points))))]
-            coords = np.column_stack([ys.ravel(), xs.ravel()])
+        coords.sort()
+        points = [(float(x), float(y)) for y, x in coords]
 
-        if coords.shape[0] > self.max_points:
-            idx = self.random_state.choice(coords.shape[0], size=self.max_points, replace=False)
-            coords = coords[idx]
-
-        ys = coords[:, 0]
-        xs = coords[:, 1]
-        pts = np.stack([xs, ys], axis=1).astype(np.float64)
-
-        grad_mag = features.gradient_magnitude[ys, xs]
-        grad_ori = features.gradient_orientation[ys, xs]
-        gabor_resp = features.gabor_response[ys, xs]
-        gabor_ori = features.gabor_orientation[ys, xs]
+        grad_mag = [features.gradient_magnitude[y][x] for y, x in coords]
+        grad_ori = [features.gradient_orientation[y][x] for y, x in coords]
+        gabor_resp = [features.gabor_response[y][x] for y, x in coords]
+        gabor_ori = [features.gabor_orientation[y][x] for y, x in coords]
 
         return SampledPointSet(
-            coordinates=pts,
+            coordinates=points,
             gradient_magnitude=grad_mag,
             gradient_orientation=grad_ori,
             gabor_response=gabor_resp,
             gabor_orientation=gabor_ori,
-            image_shape=(h, w),
+            image_shape=(height, width),
         )
 
 
@@ -329,16 +473,14 @@ class PointSampler:
 # ---------------------------------------------------------------------------
 
 
-def _circumcircle(triangle: np.ndarray) -> Tuple[np.ndarray, float]:
-    ax, ay = triangle[0]
-    bx, by = triangle[1]
-    cx, cy = triangle[2]
+def circumcircle(triangle: List[Tuple[float, float]]) -> Tuple[Tuple[float, float], float]:
+    (ax, ay), (bx, by), (cx, cy) = triangle
     d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
     if abs(d) < 1e-12:
-        return np.array([np.inf, np.inf]), np.inf
-    ax2_ay2 = ax ** 2 + ay ** 2
-    bx2_by2 = bx ** 2 + by ** 2
-    cx2_cy2 = cx ** 2 + cy ** 2
+        return ((float("inf"), float("inf")), float("inf"))
+    ax2_ay2 = ax * ax + ay * ay
+    bx2_by2 = bx * bx + by * by
+    cx2_cy2 = cx * cx + cy * cy
     ux = (
         ax2_ay2 * (by - cy)
         + bx2_by2 * (cy - ay)
@@ -349,50 +491,48 @@ def _circumcircle(triangle: np.ndarray) -> Tuple[np.ndarray, float]:
         + bx2_by2 * (ax - cx)
         + cx2_cy2 * (bx - ax)
     ) / d
-    center = np.array([ux, uy])
-    radius = float(np.hypot(ux - ax, uy - ay))
-    return center, radius
+    radius = magnitude(ux - ax, uy - ay)
+    return ((ux, uy), radius)
 
 
-def _delaunay_triangulation(points: np.ndarray) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float64)
-    n_points = points.shape[0]
+def delaunay_triangulation(points: List[Tuple[float, float]]) -> List[Tuple[int, int, int]]:
+    n_points = len(points)
     if n_points < 3:
         raise ValueError("At least three points are required for triangulation")
 
-    min_x, min_y = points.min(axis=0)
-    max_x, max_y = points.max(axis=0)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
     dx = max_x - min_x
     dy = max_y - min_y
-    delta_max = float(max(dx, dy))
+    delta_max = max(dx, dy)
     if delta_max == 0.0:
         delta_max = 1.0
     mid_x = (min_x + max_x) / 2.0
     mid_y = (min_y + max_y) / 2.0
 
-    super_pts = np.array(
-        [
-            [mid_x - 20 * delta_max, mid_y - delta_max],
-            [mid_x, mid_y + 20 * delta_max],
-            [mid_x + 20 * delta_max, mid_y - delta_max],
-        ]
-    )
-    pts_ext = np.vstack([points, super_pts])
+    super_pts = [
+        (mid_x - 20 * delta_max, mid_y - delta_max),
+        (mid_x, mid_y + 20 * delta_max),
+        (mid_x + 20 * delta_max, mid_y - delta_max),
+    ]
+    pts_ext = points + super_pts
     super_indices = (n_points, n_points + 1, n_points + 2)
 
     triangles: List[Tuple[int, int, int]] = [super_indices]
-    circumcircles: Dict[Tuple[int, int, int], Tuple[np.ndarray, float]] = {
-        super_indices: _circumcircle(pts_ext[list(super_indices)])
+    circumcircles: Dict[Tuple[int, int, int], Tuple[Tuple[float, float], float]] = {
+        super_indices: circumcircle([pts_ext[i] for i in super_indices])
     }
 
     for idx in range(n_points):
         point = pts_ext[idx]
         bad_triangles: List[Tuple[int, int, int]] = []
-        for tri in list(triangles):
+        for tri in triangles[:]:
             center, radius = circumcircles[tri]
-            if not np.isfinite(radius):
+            if not math.isfinite(radius):
                 continue
-            if np.linalg.norm(point - center) <= radius + 1e-9:
+            if magnitude(point[0] - center[0], point[1] - center[1]) <= radius + 1e-9:
                 bad_triangles.append(tri)
 
         polygon: List[Tuple[int, int]] = []
@@ -409,9 +549,9 @@ def _delaunay_triangulation(points: np.ndarray) -> np.ndarray:
 
         for edge in polygon:
             new_tri = (edge[0], edge[1], idx)
-            triangle_pts = pts_ext[list(new_tri)]
-            center, radius = _circumcircle(triangle_pts)
-            if not np.isfinite(radius):
+            triangle_points = [pts_ext[i] for i in new_tri]
+            center, radius = circumcircle(triangle_points)
+            if not math.isfinite(radius):
                 continue
             triangles.append(new_tri)
             circumcircles[new_tri] = (center, radius)
@@ -424,36 +564,42 @@ def _delaunay_triangulation(points: np.ndarray) -> np.ndarray:
 
     if not result:
         raise RuntimeError("Delaunay triangulation failed")
-
-    return np.array(result, dtype=int)
-
-
-def _triangle_circumradius(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
-    tri_pts = points[simplices]
-    a = np.linalg.norm(tri_pts[:, 1] - tri_pts[:, 0], axis=1)
-    b = np.linalg.norm(tri_pts[:, 2] - tri_pts[:, 1], axis=1)
-    c = np.linalg.norm(tri_pts[:, 0] - tri_pts[:, 2], axis=1)
-    s = (a + b + c) / 2.0
-    area_sq = np.maximum(s * (s - a) * (s - b) * (s - c), 1e-12)
-    area = np.sqrt(area_sq)
-    radius = (a * b * c) / (4.0 * area)
-    return radius
+    return result
 
 
-def _triangle_area(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
-    tri_pts = points[simplices]
-    vec1 = tri_pts[:, 1] - tri_pts[:, 0]
-    vec2 = tri_pts[:, 2] - tri_pts[:, 0]
-    cross = vec1[:, 0] * vec2[:, 1] - vec1[:, 1] * vec2[:, 0]
-    return 0.5 * np.abs(cross)
+def triangle_circumradius(points: List[Tuple[float, float]], simplices: List[Tuple[int, int, int]]) -> List[float]:
+    radii: List[float] = []
+    for a, b, c in simplices:
+        ax, ay = points[a]
+        bx, by = points[b]
+        cx, cy = points[c]
+        side_a = magnitude(bx - cx, by - cy)
+        side_b = magnitude(cx - ax, cy - ay)
+        side_c = magnitude(ax - bx, ay - by)
+        s = (side_a + side_b + side_c) / 2.0
+        area_sq = max(s * (s - side_a) * (s - side_b) * (s - side_c), 1e-12)
+        area = math.sqrt(area_sq)
+        radius = (side_a * side_b * side_c) / (4.0 * area)
+        radii.append(radius)
+    return radii
 
 
-def _variance(values: np.ndarray) -> np.ndarray:
-    mean = values.mean(axis=1, keepdims=True)
-    return ((values - mean) ** 2).mean(axis=1)
+def triangle_area(points: List[Tuple[float, float]], simplices: List[Tuple[int, int, int]]) -> List[float]:
+    areas: List[float] = []
+    for a, b, c in simplices:
+        ax, ay = points[a]
+        bx, by = points[b]
+        cx, cy = points[c]
+        area = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)) / 2.0
+        areas.append(area)
+    return areas
 
 
-def _bresenham_line(start: Tuple[int, int], end: Tuple[int, int]) -> Iterable[Tuple[int, int]]:
+def triangle_variance(values: List[List[float]]) -> List[float]:
+    return [variance_of(triple) for triple in values]
+
+
+def bresenham_line(start: Tuple[int, int], end: Tuple[int, int]) -> Iterable[Tuple[int, int]]:
     x0, y0 = start
     x1, y1 = end
     dx = abs(x1 - x0)
@@ -474,71 +620,69 @@ def _bresenham_line(start: Tuple[int, int], end: Tuple[int, int]) -> Iterable[Tu
             y0 += sy
 
 
-def _draw_polyline(
-    canvas: np.ndarray, points: np.ndarray, value: int, thickness: int = 1
-) -> None:
-    if points.shape[0] < 2:
+def draw_polyline(canvas: List[List[int]], points: List[Tuple[float, float]], value: int, thickness: int = 1) -> None:
+    if len(points) < 2:
         return
-
-    height, width = canvas.shape
+    height = len(canvas)
+    width = len(canvas[0]) if height else 0
     radius = max(0, thickness // 2)
 
-    def stamp(x: int, y: int) -> None:
+    def stamp(px: int, py: int) -> None:
         if radius == 0:
-            if 0 <= x < width and 0 <= y < height:
-                canvas[y, x] = value
+            if 0 <= px < width and 0 <= py < height:
+                canvas[py][px] = value
             return
         for dy in range(-radius, radius + 1):
             for dx in range(-radius, radius + 1):
                 if dx * dx + dy * dy > radius * radius:
                     continue
-                px = x + dx
-                py = y + dy
-                if 0 <= px < width and 0 <= py < height:
-                    canvas[py, px] = value
+                sx = px + dx
+                sy = py + dy
+                if 0 <= sx < width and 0 <= sy < height:
+                    canvas[sy][sx] = value
 
-    coords = np.round(points).astype(int)
-    for p0, p1 in zip(coords[:-1], coords[1:]):
-        x0, y0 = p0
-        x1, y1 = p1
-        for x, y in _bresenham_line((x0, y0), (x1, y1)):
-            stamp(x, y)
+    rounded = [(int(round(x)), int(round(y))) for x, y in points]
+    for (x0, y0), (x1, y1) in zip(rounded[:-1], rounded[1:]):
+        for px, py in bresenham_line((x0, y0), (x1, y1)):
+            stamp(px, py)
 
 
 @dataclass
 class TextureAwareAlphaShapeResult:
     alpha: float
-    points: np.ndarray
-    simplices: np.ndarray
-    radii: np.ndarray
-    weights: np.ndarray
-    mask: np.ndarray
-    areas: np.ndarray
+    points: List[Tuple[float, float]]
+    simplices: List[Tuple[int, int, int]]
+    radii: List[float]
+    weights: List[float]
+    mask: List[bool]
+    areas: List[float]
     image_shape: Tuple[int, int]
 
-    def selected_triangles(self) -> np.ndarray:
-        return self.simplices[self.mask]
+    def selected_indices(self) -> List[int]:
+        return [idx for idx, flag in enumerate(self.mask) if flag]
 
-    def selected_weights(self) -> np.ndarray:
-        return self.weights[self.mask]
+    def selected_triangles(self) -> List[Tuple[int, int, int]]:
+        indices = self.selected_indices()
+        return [self.simplices[idx] for idx in indices]
 
-    def selected_radii(self) -> np.ndarray:
-        return self.radii[self.mask]
+    def selected_weights(self) -> List[float]:
+        return [self.weights[idx] for idx in self.selected_indices()]
 
-    def boundary_edges(self) -> np.ndarray:
-        tris = self.selected_triangles()
-        if tris.size == 0:
-            return np.empty((0, 2), dtype=int)
-        edges = np.concatenate(
-            [tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]], axis=0
-        )
-        edges = np.sort(edges, axis=1)
-        edges_unique, counts = np.unique(edges, axis=0, return_counts=True)
-        return edges_unique[counts == 1]
+    def selected_radii(self) -> List[float]:
+        return [self.radii[idx] for idx in self.selected_indices()]
+
+    def boundary_edges(self) -> List[Tuple[int, int]]:
+        edges: Dict[Tuple[int, int], int] = {}
+        for tri in self.selected_triangles():
+            tri_edges = [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
+            for u, v in tri_edges:
+                key = (min(u, v), max(u, v))
+                edges[key] = edges.get(key, 0) + 1
+        return [edge for edge, count in edges.items() if count == 1]
 
     def connected_components(self) -> int:
         edges = self.boundary_edges()
-        if edges.size == 0:
+        if not edges:
             return 0
         adjacency: Dict[int, List[int]] = {}
         for u, v in edges:
@@ -561,26 +705,28 @@ class TextureAwareAlphaShapeResult:
         return components
 
     def total_area(self) -> float:
-        return float(self.areas[self.mask].sum())
+        return sum(self.areas[idx] for idx in self.selected_indices())
 
     def perimeter(self) -> float:
         edges = self.boundary_edges()
-        if edges.size == 0:
+        if not edges:
             return 0.0
-        pts = self.points
-        diffs = pts[edges[:, 0]] - pts[edges[:, 1]]
-        lengths = np.linalg.norm(diffs, axis=1)
-        return float(lengths.sum())
+        length = 0.0
+        for u, v in edges:
+            x0, y0 = self.points[u]
+            x1, y1 = self.points[v]
+            length += magnitude(x0 - x1, y0 - y1)
+        return length
 
     def texture_consistency(self) -> float:
-        selected = self.selected_weights()
-        if selected.size == 0:
+        weights = self.selected_weights()
+        if not weights:
             return 0.0
-        return float(selected.mean())
+        return sum(weights) / len(weights)
 
-    def contours(self) -> List[np.ndarray]:
+    def contours(self) -> List[List[Tuple[float, float]]]:
         edges = self.boundary_edges()
-        if edges.size == 0:
+        if not edges:
             return []
         adjacency: Dict[int, List[int]] = {}
         for u, v in edges:
@@ -588,22 +734,21 @@ class TextureAwareAlphaShapeResult:
             adjacency.setdefault(v, []).append(u)
 
         visited_edges = set()
-        contours: List[np.ndarray] = []
-        for start_u in adjacency:
-            for start_v in adjacency[start_u]:
-                edge_key = tuple(sorted((start_u, start_v)))
+        contours: List[List[Tuple[float, float]]] = []
+        for start_u, neighbors in adjacency.items():
+            for start_v in neighbors:
+                edge_key = (min(start_u, start_v), max(start_u, start_v))
                 if edge_key in visited_edges:
                     continue
-                contour = [self.points[start_u], self.points[start_v]]
+                contour: List[Tuple[float, float]] = [self.points[start_u], self.points[start_v]]
                 visited_edges.add(edge_key)
                 u, v = start_u, start_v
                 while True:
-                    neighbors = adjacency[v]
-                    next_candidates = [n for n in neighbors if n != u]
+                    next_candidates = [n for n in adjacency.get(v, []) if n != u]
                     if not next_candidates:
                         break
                     next_node = next_candidates[0]
-                    edge_key = tuple(sorted((v, next_node)))
+                    edge_key = (min(v, next_node), max(v, next_node))
                     if edge_key in visited_edges:
                         break
                     contour.append(self.points[next_node])
@@ -611,18 +756,14 @@ class TextureAwareAlphaShapeResult:
                     u, v = v, next_node
                     if v == start_u:
                         break
-                contours.append(np.array(contour, dtype=np.float32))
+                contours.append(contour)
         return contours
 
-    def render_mask(self, thickness: int = 2) -> np.ndarray:
-        if self.points.size == 0:
-            return np.zeros((0, 0), dtype=np.uint8)
-        contours = self.contours()
-        if not contours:
-            return np.zeros((0, 0), dtype=np.uint8)
-        canvas = np.zeros(self.image_shape, dtype=np.uint8)
-        for contour in contours:
-            _draw_polyline(canvas, contour, value=255, thickness=thickness)
+    def render_mask(self, thickness: int = 2) -> List[List[int]]:
+        height, width = self.image_shape
+        canvas = [[0 for _ in range(width)] for _ in range(height)]
+        for contour in self.contours():
+            draw_polyline(canvas, contour, value=1, thickness=thickness)
         return canvas
 
 
@@ -632,43 +773,40 @@ class TextureAwareAlphaShape:
     def __init__(self, beta: float = 4.0) -> None:
         self.beta = beta
 
-    def _texture_weights(self, samples: SampledPointSet, simplices: np.ndarray) -> np.ndarray:
-        grad = samples.gradient_magnitude[simplices]
-        tex = samples.gabor_response[simplices]
+    def _texture_weight_for_triangle(
+        self, samples: SampledPointSet, simplex: Tuple[int, int, int]
+    ) -> float:
+        features = samples.feature_triplet(simplex)
+        grad = features["gradient"]
+        tex = features["texture"]
+        grad_ori = features["grad_orientation"]
+        tex_ori = features["tex_orientation"]
 
-        theta = samples.gradient_orientation
-        phi = samples.gabor_orientation
-
-        theta_unit = np.stack([np.cos(theta), np.sin(theta)], axis=1)
-        phi_unit = np.stack([np.cos(phi), np.sin(phi)], axis=1)
-
-        theta_cos = theta_unit[simplices, 0]
-        theta_sin = theta_unit[simplices, 1]
-        phi_cos = phi_unit[simplices, 0]
-        phi_sin = phi_unit[simplices, 1]
+        theta_cos = [math.cos(angle) for angle in grad_ori]
+        theta_sin = [math.sin(angle) for angle in grad_ori]
+        phi_cos = [math.cos(angle) for angle in tex_ori]
+        phi_sin = [math.sin(angle) for angle in tex_ori]
 
         texture_diff = (
-            _variance(grad)
-            + _variance(tex)
-            + _variance(theta_cos)
-            + _variance(theta_sin)
-            + _variance(phi_cos)
-            + _variance(phi_sin)
+            variance_of(grad)
+            + variance_of(tex)
+            + variance_of(theta_cos)
+            + variance_of(theta_sin)
+            + variance_of(phi_cos)
+            + variance_of(phi_sin)
         )
-
-        weights = np.exp(-self.beta * texture_diff)
-        return weights
+        return math.exp(-self.beta * texture_diff)
 
     def build(self, samples: SampledPointSet, alpha: float) -> TextureAwareAlphaShapeResult:
         points = samples.coordinates
-        if points.shape[0] < 3:
+        if len(points) < 3:
             raise ValueError("At least three sample points are required")
 
-        simplices = _delaunay_triangulation(points)
-        radii = _triangle_circumradius(points, simplices)
-        areas = _triangle_area(points, simplices)
-        weights = self._texture_weights(samples, simplices)
-        mask = radii <= alpha * weights
+        simplices = delaunay_triangulation(points)
+        radii = triangle_circumradius(points, simplices)
+        areas = triangle_area(points, simplices)
+        weights = [self._texture_weight_for_triangle(samples, simplex) for simplex in simplices]
+        mask = [radius <= alpha * weight for radius, weight in zip(radii, weights)]
 
         return TextureAwareAlphaShapeResult(
             alpha=alpha,
@@ -706,6 +844,30 @@ class StabilityAnalysis:
     best_result: TextureAwareAlphaShapeResult
 
 
+def finite_difference(values: List[float], xs: List[float]) -> List[float]:
+    n = len(values)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0.0]
+    derivatives: List[float] = []
+    for i in range(n):
+        if i == 0:
+            dv = values[1] - values[0]
+            dx = xs[1] - xs[0]
+        elif i == n - 1:
+            dv = values[-1] - values[-2]
+            dx = xs[-1] - xs[-2]
+        else:
+            dv = values[i + 1] - values[i - 1]
+            dx = xs[i + 1] - xs[i - 1]
+        if dx == 0.0:
+            derivatives.append(0.0)
+        else:
+            derivatives.append(dv / dx)
+    return derivatives
+
+
 class AlphaStabilityAnalyzer:
     """Evaluates geometry/texture stability curves and selects α*."""
 
@@ -718,45 +880,44 @@ class AlphaStabilityAnalyzer:
         if not results:
             raise ValueError("No α-shape results provided")
 
-        alphas = np.array([res.alpha for res in results], dtype=np.float64)
-        order = np.argsort(alphas)
-        results = [results[i] for i in order]
-        alphas = alphas[order]
+        ordered = sorted(results, key=lambda res: res.alpha)
+        alphas = [res.alpha for res in ordered]
+        areas = [res.total_area() for res in ordered]
+        components = [res.connected_components() for res in ordered]
+        perimeters = [res.perimeter() for res in ordered]
+        texture_consistency = [res.texture_consistency() for res in ordered]
 
-        areas = np.array([res.total_area() for res in results])
-        components = np.array([res.connected_components() for res in results], dtype=np.float64)
-        perimeters = np.array([res.perimeter() for res in results])
-        texture_consistency = np.array([res.texture_consistency() for res in results])
+        area_derivative = finite_difference(areas, alphas)
+        texture_derivative = finite_difference(texture_consistency, alphas)
 
-        area_derivative = np.gradient(areas, alphas, edge_order=2)
-        texture_derivative = np.gradient(texture_consistency, alphas, edge_order=2)
+        csi_geometry: List[float] = []
+        for area, deriv in zip(areas, area_derivative):
+            denom = area if area > 1e-8 else 1e-8
+            csi_geometry.append(math.exp(-abs(deriv / denom)))
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            csi_geometry = np.exp(-np.abs(area_derivative / np.maximum(areas, 1e-8)))
-        csi_texture = np.exp(-np.abs(texture_derivative))
-        csi = self.lam * csi_geometry + (1.0 - self.lam) * csi_texture
+        csi_texture = [math.exp(-abs(deriv)) for deriv in texture_derivative]
+        csi = [self.lam * cg + (1.0 - self.lam) * ct for cg, ct in zip(csi_geometry, csi_texture)]
 
         records: List[StabilityRecord] = []
-        best_idx = int(np.argmax(csi))
-        for idx, res in enumerate(results):
+        best_idx = max(range(len(csi)), key=lambda idx: csi[idx])
+        for idx, res in enumerate(ordered):
             record = StabilityRecord(
-                alpha=float(alphas[idx]),
-                area=float(areas[idx]),
-                components=int(components[idx]),
-                perimeter=float(perimeters[idx]),
-                texture_consistency=float(texture_consistency[idx]),
-                csi_geometry=float(csi_geometry[idx]),
-                csi_texture=float(csi_texture[idx]),
-                csi=float(csi[idx]),
+                alpha=alphas[idx],
+                area=areas[idx],
+                components=components[idx],
+                perimeter=perimeters[idx],
+                texture_consistency=texture_consistency[idx],
+                csi_geometry=csi_geometry[idx],
+                csi_texture=csi_texture[idx],
+                csi=csi[idx],
             )
             records.append(record)
 
-        analysis = StabilityAnalysis(
+        return StabilityAnalysis(
             records=records,
             best_record=records[best_idx],
-            best_result=results[best_idx],
+            best_result=ordered[best_idx],
         )
-        return analysis
 
 
 # ---------------------------------------------------------------------------
@@ -765,11 +926,11 @@ class AlphaStabilityAnalyzer:
 
 
 def run_texture_alpha_shape(
-    image: np.ndarray,
+    image: Image,
     alpha_values: Sequence[float],
     beta: float = 4.0,
     lam: float = 0.7,
-    max_points: int = 4000,
+    max_points: int = 1500,
 ) -> StabilityAnalysis:
     extractor = TextureFeatureExtractor()
     features = extractor.extract(image)
