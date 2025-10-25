@@ -13,8 +13,9 @@ This module implements the pipeline described in
    maximises the combined geometry/texture stability criterion.
 
 The public API intentionally mirrors the design document so that each class
-corresponds to one section of the specification.  The module is self-contained
-and depends only on NumPy, OpenCV, and SciPy.
+corresponds to one section of the specification.  The implementation is
+deliberately NumPy-only so it can run in lightweight environments without
+OpenCV or SciPy.
 """
 
 from __future__ import annotations
@@ -22,14 +23,74 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
-from scipy.spatial import Delaunay
 
 
 # ---------------------------------------------------------------------------
 # Module ① – Texture feature extraction
 # ---------------------------------------------------------------------------
+
+
+def _direct_convolve2d(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    kh, kw = kernel.shape
+    pad_y, pad_x = kh // 2, kw // 2
+    padded = np.pad(image, ((pad_y, pad_y), (pad_x, pad_x)), mode="reflect")
+    kernel_flipped = np.flip(kernel)
+    output = np.zeros_like(image, dtype=np.float32)
+    for y in range(image.shape[0]):
+        for x in range(image.shape[1]):
+            region = padded[y : y + kh, x : x + kw]
+            output[y, x] = float(np.sum(region * kernel_flipped))
+    return output
+
+
+def _fft_convolve2d(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    h, w = image.shape
+    kh, kw = kernel.shape
+    fh = h + kh - 1
+    fw = w + kw - 1
+    kernel_flipped = np.flip(kernel)
+    f_image = np.fft.rfft2(image, s=(fh, fw))
+    f_kernel = np.fft.rfft2(kernel_flipped, s=(fh, fw))
+    convolved = np.fft.irfft2(f_image * f_kernel, s=(fh, fw))
+    start_y = kh // 2
+    start_x = kw // 2
+    end_y = start_y + h
+    end_x = start_x + w
+    return convolved[start_y:end_y, start_x:end_x].astype(np.float32)
+
+
+def _convolve2d(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    if max(kernel.shape) <= 7:
+        return _direct_convolve2d(image, kernel.astype(np.float32))
+    return _fft_convolve2d(image, kernel.astype(np.float32))
+
+
+def _gaussian_kernel1d(sigma: float) -> np.ndarray:
+    radius = max(1, int(round(3 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(x ** 2) / (2.0 * sigma ** 2))
+    kernel /= kernel.sum() or 1.0
+    return kernel
+
+
+def _convolve1d_reflect(image: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
+    pad = kernel.size // 2
+    pad_config = [(0, 0)] * image.ndim
+    pad_config[axis] = (pad, pad)
+    padded = np.pad(image, pad_config, mode="reflect")
+
+    def apply(vec: np.ndarray) -> np.ndarray:
+        return np.convolve(vec, kernel, mode="valid")
+
+    result = np.apply_along_axis(apply, axis, padded)
+    return result.astype(np.float32)
+
+
+def _gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
+    kernel = _gaussian_kernel1d(sigma)
+    temp = _convolve1d_reflect(image, kernel, axis=0)
+    return _convolve1d_reflect(temp, kernel, axis=1)
 
 
 @dataclass
@@ -58,7 +119,25 @@ class TextureFeatureExtractor:
         self.scales = scales
         self.base_sigma = base_sigma
         self.gamma = gamma
-        self.kernel_size = kernel_size
+        self.kernel_size = int(max(3, kernel_size | 1))
+
+    def _gabor_kernel(
+        self, sigma: float, theta: float, lambd: float, gamma: float, psi: float
+    ) -> np.ndarray:
+        half = (self.kernel_size - 1) / 2.0
+        y, x = np.mgrid[-half : half + 1, -half : half + 1]
+        x_theta = x * math.cos(theta) + y * math.sin(theta)
+        y_theta = -x * math.sin(theta) + y * math.cos(theta)
+        gaussian_envelope = np.exp(
+            -0.5
+            * (
+                (x_theta ** 2) / (sigma ** 2)
+                + (gamma ** 2) * (y_theta ** 2) / (sigma ** 2)
+            )
+        )
+        sinusoid = np.cos((2.0 * math.pi * x_theta / lambd) + psi)
+        kernel = gaussian_envelope * sinusoid
+        return kernel.astype(np.float32)
 
     def extract(self, image: np.ndarray) -> TextureFeatures:
         if image.ndim != 2:
@@ -68,8 +147,12 @@ class TextureFeatureExtractor:
         if image_float.max() > 1.0:
             image_float /= 255.0
 
-        grad_x = cv2.Sobel(image_float, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(image_float, cv2.CV_32F, 0, 1, ksize=3)
+        sobel_x = np.array(
+            [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=np.float32
+        )
+        sobel_y = sobel_x.T
+        grad_x = _convolve2d(image_float, sobel_x) / 8.0
+        grad_y = _convolve2d(image_float, sobel_y) / 8.0
         grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
         grad_ori = np.arctan2(grad_y, grad_x)
 
@@ -86,16 +169,14 @@ class TextureFeatureExtractor:
             lambd = lambda_base * (1.5 ** scale)
             for orientation_idx in range(self.orientations):
                 theta = math.pi * orientation_idx / self.orientations
-                kernel = cv2.getGaborKernel(
-                    (self.kernel_size, self.kernel_size),
-                    sigma,
-                    theta,
-                    lambd,
-                    self.gamma,
-                    psi=0,
-                    ktype=cv2.CV_32F,
+                kernel = self._gabor_kernel(
+                    sigma=sigma,
+                    theta=theta,
+                    lambd=lambd,
+                    gamma=self.gamma,
+                    psi=0.0,
                 )
-                response = cv2.filter2D(image_float, cv2.CV_32F, kernel)
+                response = _convolve2d(image_float, kernel)
                 response = np.abs(response)
 
                 update_mask = response > gabor_max
@@ -114,8 +195,8 @@ class TextureFeatureExtractor:
             gabor_orientation = np.zeros_like(image_float)
 
         # Texture saliency via local variance (for sampling support)
-        blurred = cv2.GaussianBlur(image_float, (0, 0), sigmaX=1.0, sigmaY=1.0)
-        squared_blur = cv2.GaussianBlur(image_float ** 2, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        blurred = _gaussian_blur(image_float, sigma=1.0)
+        squared_blur = _gaussian_blur(image_float ** 2, sigma=1.0)
         texture_variance = np.maximum(squared_blur - blurred ** 2, 0.0)
         max_var = float(texture_variance.max()) or 1.0
         texture_saliency = texture_variance / max_var
@@ -177,12 +258,13 @@ class PointSampler:
             raise ValueError("PointSampler expects a grayscale image")
 
         h, w = image.shape
-        image_u8 = image.astype(np.uint8)
-
-        # Edge-driven sampling (Canny over gradient map)
-        low = int(50)
-        high = int(150)
-        edge_map = cv2.Canny(image_u8, low, high) > 0
+        # Edge-driven sampling using gradient magnitude percentiles
+        grad_flat = features.gradient_magnitude.ravel()
+        if grad_flat.size == 0:
+            raise ValueError("Empty gradient magnitude map")
+        edge_threshold = float(np.quantile(grad_flat, 0.75))
+        edge_threshold = max(edge_threshold, 0.1)
+        edge_map = features.gradient_magnitude >= edge_threshold
         edge_coords = np.column_stack(np.nonzero(edge_map))
 
         if edge_coords.size == 0:
@@ -247,6 +329,105 @@ class PointSampler:
 # ---------------------------------------------------------------------------
 
 
+def _circumcircle(triangle: np.ndarray) -> Tuple[np.ndarray, float]:
+    ax, ay = triangle[0]
+    bx, by = triangle[1]
+    cx, cy = triangle[2]
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-12:
+        return np.array([np.inf, np.inf]), np.inf
+    ax2_ay2 = ax ** 2 + ay ** 2
+    bx2_by2 = bx ** 2 + by ** 2
+    cx2_cy2 = cx ** 2 + cy ** 2
+    ux = (
+        ax2_ay2 * (by - cy)
+        + bx2_by2 * (cy - ay)
+        + cx2_cy2 * (ay - by)
+    ) / d
+    uy = (
+        ax2_ay2 * (cx - bx)
+        + bx2_by2 * (ax - cx)
+        + cx2_cy2 * (bx - ax)
+    ) / d
+    center = np.array([ux, uy])
+    radius = float(np.hypot(ux - ax, uy - ay))
+    return center, radius
+
+
+def _delaunay_triangulation(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    n_points = points.shape[0]
+    if n_points < 3:
+        raise ValueError("At least three points are required for triangulation")
+
+    min_x, min_y = points.min(axis=0)
+    max_x, max_y = points.max(axis=0)
+    dx = max_x - min_x
+    dy = max_y - min_y
+    delta_max = float(max(dx, dy))
+    if delta_max == 0.0:
+        delta_max = 1.0
+    mid_x = (min_x + max_x) / 2.0
+    mid_y = (min_y + max_y) / 2.0
+
+    super_pts = np.array(
+        [
+            [mid_x - 20 * delta_max, mid_y - delta_max],
+            [mid_x, mid_y + 20 * delta_max],
+            [mid_x + 20 * delta_max, mid_y - delta_max],
+        ]
+    )
+    pts_ext = np.vstack([points, super_pts])
+    super_indices = (n_points, n_points + 1, n_points + 2)
+
+    triangles: List[Tuple[int, int, int]] = [super_indices]
+    circumcircles: Dict[Tuple[int, int, int], Tuple[np.ndarray, float]] = {
+        super_indices: _circumcircle(pts_ext[list(super_indices)])
+    }
+
+    for idx in range(n_points):
+        point = pts_ext[idx]
+        bad_triangles: List[Tuple[int, int, int]] = []
+        for tri in list(triangles):
+            center, radius = circumcircles[tri]
+            if not np.isfinite(radius):
+                continue
+            if np.linalg.norm(point - center) <= radius + 1e-9:
+                bad_triangles.append(tri)
+
+        polygon: List[Tuple[int, int]] = []
+        for tri in bad_triangles:
+            triangles.remove(tri)
+            del circumcircles[tri]
+            edges = [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
+            for edge in edges:
+                edge_sorted = tuple(sorted(edge))
+                if edge_sorted in polygon:
+                    polygon.remove(edge_sorted)
+                else:
+                    polygon.append(edge_sorted)
+
+        for edge in polygon:
+            new_tri = (edge[0], edge[1], idx)
+            triangle_pts = pts_ext[list(new_tri)]
+            center, radius = _circumcircle(triangle_pts)
+            if not np.isfinite(radius):
+                continue
+            triangles.append(new_tri)
+            circumcircles[new_tri] = (center, radius)
+
+    result: List[Tuple[int, int, int]] = []
+    for tri in triangles:
+        if any(v >= n_points for v in tri):
+            continue
+        result.append(tri)
+
+    if not result:
+        raise RuntimeError("Delaunay triangulation failed")
+
+    return np.array(result, dtype=int)
+
+
 def _triangle_circumradius(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
     tri_pts = points[simplices]
     a = np.linalg.norm(tri_pts[:, 1] - tri_pts[:, 0], axis=1)
@@ -272,6 +453,58 @@ def _variance(values: np.ndarray) -> np.ndarray:
     return ((values - mean) ** 2).mean(axis=1)
 
 
+def _bresenham_line(start: Tuple[int, int], end: Tuple[int, int]) -> Iterable[Tuple[int, int]]:
+    x0, y0 = start
+    x1, y1 = end
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        yield x0, y0
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def _draw_polyline(
+    canvas: np.ndarray, points: np.ndarray, value: int, thickness: int = 1
+) -> None:
+    if points.shape[0] < 2:
+        return
+
+    height, width = canvas.shape
+    radius = max(0, thickness // 2)
+
+    def stamp(x: int, y: int) -> None:
+        if radius == 0:
+            if 0 <= x < width and 0 <= y < height:
+                canvas[y, x] = value
+            return
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx * dx + dy * dy > radius * radius:
+                    continue
+                px = x + dx
+                py = y + dy
+                if 0 <= px < width and 0 <= py < height:
+                    canvas[py, px] = value
+
+    coords = np.round(points).astype(int)
+    for p0, p1 in zip(coords[:-1], coords[1:]):
+        x0, y0 = p0
+        x1, y1 = p1
+        for x, y in _bresenham_line((x0, y0), (x1, y1)):
+            stamp(x, y)
+
+
 @dataclass
 class TextureAwareAlphaShapeResult:
     alpha: float
@@ -281,6 +514,7 @@ class TextureAwareAlphaShapeResult:
     weights: np.ndarray
     mask: np.ndarray
     areas: np.ndarray
+    image_shape: Tuple[int, int]
 
     def selected_triangles(self) -> np.ndarray:
         return self.simplices[self.mask]
@@ -386,12 +620,9 @@ class TextureAwareAlphaShapeResult:
         contours = self.contours()
         if not contours:
             return np.zeros((0, 0), dtype=np.uint8)
-        max_x = int(np.ceil(self.points[:, 0].max())) + 1
-        max_y = int(np.ceil(self.points[:, 1].max())) + 1
-        canvas = np.zeros((max_y, max_x), dtype=np.uint8)
+        canvas = np.zeros(self.image_shape, dtype=np.uint8)
         for contour in contours:
-            pts = np.round(contour).astype(np.int32)
-            cv2.polylines(canvas, [pts], isClosed=False, color=255, thickness=thickness)
+            _draw_polyline(canvas, contour, value=255, thickness=thickness)
         return canvas
 
 
@@ -433,8 +664,7 @@ class TextureAwareAlphaShape:
         if points.shape[0] < 3:
             raise ValueError("At least three sample points are required")
 
-        triangulation = Delaunay(points)
-        simplices = triangulation.simplices
+        simplices = _delaunay_triangulation(points)
         radii = _triangle_circumradius(points, simplices)
         areas = _triangle_area(points, simplices)
         weights = self._texture_weights(samples, simplices)
@@ -448,6 +678,7 @@ class TextureAwareAlphaShape:
             weights=weights,
             mask=mask,
             areas=areas,
+            image_shape=samples.image_shape,
         )
 
 
